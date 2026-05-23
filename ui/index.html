@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agentic Commerce Simulator</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <div class="header-left">
+      <span class="logo">⚡ Agentic Commerce</span>
+      <span class="subtitle">God View Simulator</span>
+    </div>
+    <div class="header-stats">
+      <div class="stat-pill" id="stat-revenue">💰 $0.00</div>
+      <div class="stat-pill" id="stat-orders">📦 0 orders</div>
+      <div class="stat-pill" id="stat-active">👤 0 active</div>
+      <div class="stat-pill" id="stat-events">📡 0 events</div>
+    </div>
+    <div class="header-controls">
+      <div class="sim-status" id="sim-status">
+        <span class="status-dot idle"></span>
+        <span id="status-label">Stopped</span>
+      </div>
+      <button class="btn btn-start" id="btn-start" onclick="startSim()">▶ Start</button>
+      <button class="btn btn-stop" id="btn-stop" onclick="stopSim()" disabled>⏹ Stop</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Consumers Column -->
+    <section class="panel panel-consumers">
+      <div class="panel-header">
+        <h2>👤 Consumer Agents</h2>
+        <span class="panel-count" id="consumer-count">5 agents</span>
+      </div>
+      <div class="agents-grid" id="consumers-grid"></div>
+    </section>
+
+    <!-- Activity Feed -->
+    <section class="panel panel-feed">
+      <div class="panel-header">
+        <h2>📡 Activity Feed</h2>
+        <button class="btn-sm" onclick="clearFeed()">Clear</button>
+      </div>
+      <div class="feed" id="feed"></div>
+    </section>
+
+    <!-- Businesses Column -->
+    <section class="panel panel-businesses">
+      <div class="panel-header">
+        <h2>🏪 Business Agents</h2>
+        <span class="panel-count" id="merchant-count">5 merchants · 3 suppliers</span>
+      </div>
+      <div class="agents-grid" id="merchants-grid"></div>
+      <div class="panel-header" style="margin-top:1rem">
+        <h2>🏭 Suppliers</h2>
+      </div>
+      <div class="agents-grid" id="suppliers-grid"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
