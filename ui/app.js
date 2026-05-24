@@ -30,6 +30,31 @@ function initCanvas() {
   new ResizeObserver(resize).observe(canvas);
   resize();
   rafId = requestAnimationFrame(renderNetwork);
+
+  canvas.addEventListener('click', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    for (const [id, node] of Object.entries(netNodes)) {
+      const dx = x - node.x, dy = y - node.y;
+      if (Math.sqrt(dx*dx + dy*dy) <= 16) {
+        window.location.href = node.type === 'consumer' ? `/consumer/${id}` : `/business/${id}`;
+        return;
+      }
+    }
+  });
+
+  canvas.addEventListener('mousemove', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    let onNode = false;
+    for (const node of Object.values(netNodes)) {
+      const dx = x - node.x, dy = y - node.y;
+      if (Math.sqrt(dx*dx + dy*dy) <= 16) { onNode = true; break; }
+    }
+    canvas.style.cursor = onNode ? 'pointer' : 'default';
+  });
 }
 
 function layoutNodes() {
