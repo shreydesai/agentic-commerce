@@ -1,5 +1,7 @@
+from typing import Optional
 import asyncio
 import random
+import uuid
 from enum import Enum
 from agents.base import BaseAgent
 from config import CONSUMER_TICK_SECONDS
@@ -14,31 +16,120 @@ class ConsumerState(Enum):
 
 
 class ConsumerAgent(BaseAgent):
-    def __init__(self, agent_id, name, persona, preferences, budget, event_bus, message_bus, merchant_registry):
+    def __init__(
+        self,
+        agent_id: str,
+        # demographics
+        name: str,
+        age: int,
+        gender: str,
+        occupation: str,
+        annual_income: float,
+        education: str,
+        location: str,
+        household_size: int,
+        # behavior
+        shopping_interests: list[str],
+        price_sensitivity: float,   # 0-1
+        brand_loyalty: float,        # 0-1
+        impulse_tendency: float,     # 0-1
+        research_depth: float,       # 0-1
+        preferred_channels: list[str],
+        # financial
+        budget: float,
+        credit_score: int,
+        # persona summary
+        persona: str,
+        event_bus=None,
+        message_bus: dict = None,
+        business_registry: dict = None,
+    ):
         super().__init__(agent_id, name, "consumer", event_bus, message_bus)
-        self.persona = persona
-        self.preferences = preferences
+        self.age = age
+        self.gender = gender
+        self.occupation = occupation
+        self.annual_income = annual_income
+        self.education = education
+        self.location = location
+        self.household_size = household_size
+        self.shopping_interests = shopping_interests
+        self.price_sensitivity = price_sensitivity
+        self.brand_loyalty = brand_loyalty
+        self.impulse_tendency = impulse_tendency
+        self.research_depth = research_depth
+        self.preferred_channels = preferred_channels
         self.budget = budget
-        self.merchant_registry = merchant_registry
-        self.state = ConsumerState.IDLE
-        self.purchase_history = []
-        self.current_search = {}
-        self.candidate_products = []
-        self.shortlisted = []
-        self.total_spent = 0.0
+        self.credit_score = credit_score
+        self.persona = persona
+        self.business_registry = business_registry or {}
 
-    def get_state_dict(self):
+        self.state = ConsumerState.IDLE
+        self.total_spent = 0.0
+        self.purchase_history: list[dict] = []
+        self.current_transaction: Optional[dict] = None
+        self.candidate_products: list[dict] = []
+        self.shortlisted: list[dict] = []
+
+    # ── Serialization ───────────────────────────────────────────
+    def get_state_dict(self) -> dict:
         return {
             "agent_id": self.agent_id,
             "name": self.name,
-            "persona": self.persona,
-            "preferences": self.preferences,
+            "age": self.age,
+            "gender": self.gender,
+            "occupation": self.occupation,
+            "annual_income": self.annual_income,
+            "education": self.education,
+            "location": self.location,
+            "household_size": self.household_size,
+            "shopping_interests": self.shopping_interests,
+            "price_sensitivity": self.price_sensitivity,
+            "brand_loyalty": self.brand_loyalty,
+            "impulse_tendency": self.impulse_tendency,
+            "research_depth": self.research_depth,
+            "preferred_channels": self.preferred_channels,
             "budget": self.budget,
+            "credit_score": self.credit_score,
+            "persona": self.persona,
             "state": self.state.value,
             "total_spent": round(self.total_spent, 2),
             "purchase_count": len(self.purchase_history),
+            "current_transaction_id": (self.current_transaction or {}).get("transaction_id"),
         }
 
+    def restore_from_state(self, state: dict):
+        self.total_spent = state.get("total_spent", 0.0)
+        self.purchase_history = state.get("purchase_history", [])
+
+    def _new_transaction(self) -> dict:
+        return {
+            "transaction_id": f"TXN-{str(uuid.uuid4())[:6].upper()}",
+            "consumer_id": self.agent_id,
+            "consumer_name": self.name,
+            "status": "discovering",
+            "funnel_steps": [],
+            "businesses_contacted": [],
+            "products_considered": [],
+            "shortlisted": [],
+            "final_product": None,
+            "final_merchant": None,
+            "total": None,
+            "started_at": None,
+            "completed_at": None,
+        }
+
+    def _txn_step(self, stage: str, details: str):
+        from datetime import datetime
+        if self.current_transaction:
+            self.current_transaction["funnel_steps"].append({
+                "stage": stage, "details": details,
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+
+    def _txn_id(self) -> Optional[str]:
+        return (self.current_transaction or {}).get("transaction_id")
+
+    # ── Run loop ────────────────────────────────────────────────
     async def run(self):
         await asyncio.sleep(random.uniform(2, 10))
         while self.active:
@@ -50,7 +141,9 @@ class ConsumerAgent(BaseAgent):
 
     async def tick(self):
         if self.state == ConsumerState.IDLE:
-            if random.random() < 0.65:
+            # Higher impulse → more likely to start shopping
+            threshold = 0.4 + self.impulse_tendency * 0.3
+            if random.random() < threshold:
                 await self._start_discovery()
         elif self.state == ConsumerState.DISCOVERING:
             await self._do_discovery()
@@ -61,80 +154,126 @@ class ConsumerAgent(BaseAgent):
         elif self.state == ConsumerState.POST_PURCHASE:
             await self._do_post_purchase()
 
+    # ── Discovery ───────────────────────────────────────────────
     async def _start_discovery(self):
+        from datetime import datetime
         self.state = ConsumerState.DISCOVERING
+        self.current_transaction = self._new_transaction()
+        self.current_transaction["started_at"] = datetime.utcnow().isoformat()
+        self._txn_step("discovering", "Started browsing")
         await self.emit_event(
             "state_change",
-            {"state": "discovering", "preferences": self.preferences},
+            {"state": "discovering", "preferences": self.shopping_interests},
             f"{self.name} started browsing — looking for something to buy",
+            transaction_id=self._txn_id(),
         )
+        await self._emit_transaction_update("discovering")
 
     async def _do_discovery(self):
+        remaining = self.budget - self.total_spent
         result = await self.call_llm(
-            system=f"You are {self.name}, a shopper. Preferences: {', '.join(self.preferences)}. Budget: ${self.budget - self.total_spent:.0f} remaining. Return ONLY valid JSON, no explanation.",
-            user=f'Decide what to search for. Return: {{"category": "one of {self.preferences}", "query": "2-4 word product search", "max_price": number}}',
+            system=(
+                f"You are {self.name}, {self.age}yo {self.gender} {self.occupation}. "
+                f"Income: ${self.annual_income:,.0f}. Location: {self.location}. "
+                f"Interests: {', '.join(self.shopping_interests)}. "
+                f"Price sensitivity: {self.price_sensitivity:.1f}/1. "
+                f"Budget left: ${remaining:.0f}. Return ONLY valid JSON."
+            ),
+            user=f'What to shop for? Return: {{"category": "one of {self.shopping_interests}", "query": "2-4 word search", "max_price": number}}',
         )
         if "error" in result or "category" not in result:
-            cat = random.choice(self.preferences)
-            result = {"category": cat, "query": f"best {cat} product", "max_price": min(200, self.budget - self.total_spent)}
-        self.current_search = result
+            cat = random.choice(self.shopping_interests)
+            result = {"category": cat, "query": f"best {cat} product", "max_price": min(150, remaining)}
 
+        self._txn_step("discovering", f"Searching for: {result.get('query','')} (category: {result.get('category','')})")
+
+        # Find relevant B2C businesses
         relevant = [
-            m for m in self.merchant_registry.values()
-            if m.vertical in self.preferences or result.get("category", "") == m.vertical
+            b for b in self.business_registry.values()
+            if b.business_type == "B2C"
+            and (b.vertical == result.get("category", "") or b.vertical in self.shopping_interests)
         ]
         if not relevant:
-            relevant = list(self.merchant_registry.values())
+            relevant = [b for b in self.business_registry.values() if b.business_type == "B2C"]
         selected = random.sample(relevant, min(2, len(relevant)))
 
         self.candidate_products = []
-        for merchant in selected:
-            await self.send_message(merchant.agent_id, "product_query", {
+        for biz in selected:
+            if biz.agent_id not in (self.current_transaction or {}).get("businesses_contacted", []):
+                (self.current_transaction or {}).setdefault("businesses_contacted", []).append(biz.agent_id)
+            await self.send_message(biz.agent_id, "product_query", {
                 "query": result.get("query", ""),
                 "category": result.get("category", ""),
-                "max_price": result.get("max_price", self.budget),
-            })
+                "max_price": result.get("max_price", remaining),
+                "transaction_id": self._txn_id(),
+            }, transaction_id=self._txn_id())
             await self.emit_event(
                 "product_query",
-                {"merchant": merchant.name, "query": result.get("query", "")},
-                f"{self.name} asked {merchant.name}: \"{result.get('query', '')}\"",
+                {"merchant": biz.name, "query": result.get("query", ""), "quality_score": biz.quality_score},
+                f"{self.name} asked {biz.name}: \"{result.get('query','')}\"",
+                transaction_id=self._txn_id(),
+                to_agent_id=biz.agent_id,
             )
 
         await asyncio.sleep(3)
-
         for _ in range(len(selected)):
             msg = await self.receive_message(timeout=4.0)
             if msg and msg.message_type == "product_response":
                 self.candidate_products.extend(msg.content.get("products", []))
 
         if self.candidate_products:
+            if self.current_transaction:
+                self.current_transaction["products_considered"] = [
+                    {"sku": p["sku"], "name": p["name"], "merchant": p["merchant_name"]}
+                    for p in self.candidate_products
+                ]
             self.state = ConsumerState.CONSIDERING
+            self._txn_step("considering", f"Found {len(self.candidate_products)} products")
             await self.emit_event(
                 "state_change",
                 {"state": "considering", "product_count": len(self.candidate_products)},
                 f"{self.name} found {len(self.candidate_products)} product(s) to consider",
+                transaction_id=self._txn_id(),
             )
+            await self._emit_transaction_update("considering")
         else:
+            self._end_transaction("abandoned")
             self.state = ConsumerState.IDLE
 
+    # ── Consideration ───────────────────────────────────────────
     async def _do_consideration(self):
-        if not self.candidate_products:
-            self.state = ConsumerState.IDLE
-            return
-
-        affordable = [p for p in self.candidate_products if p.get("price", 9999) <= (self.budget - self.total_spent)]
+        remaining = self.budget - self.total_spent
+        affordable = [p for p in self.candidate_products if p.get("price", 9999) <= remaining]
         if not affordable:
+            self._end_transaction("abandoned")
             self.state = ConsumerState.IDLE
             self.candidate_products = []
             return
 
+        # Include quality score in consideration prompt to show impact of imperfect catalogs
         product_list = "\n".join(
-            f"- {p['name']} ${p['price']} from {p['merchant_name']} SKU:{p['sku']}"
-            for p in affordable[:4]
+            f"- {p['name']} ${p['price']:.2f} from {p['merchant_name']} "
+            f"[quality: {p.get('quality_score', 100):.0f}/100"
+            + (" ⚠️ incomplete catalog" if p.get("has_quality_issues") else "") + f"] SKU:{p['sku']}"
+            for p in affordable[:5]
         )
+
+        # Research depth affects how likely they are to ask questions
+        ask_question = self.research_depth > 0.5 and random.random() < self.research_depth
+
         result = await self.call_llm(
-            system=f"You are {self.name}. {self.persona} Budget left: ${self.budget - self.total_spent:.0f}. Return ONLY valid JSON.",
-            user=f"Evaluate:\n{product_list}\nReturn: {{\"shortlisted_skus\": [\"sku\"], \"has_question\": true/false, \"question\": \"optional question\"}}",
+            system=(
+                f"You are {self.name}. {self.persona} "
+                f"Budget left: ${remaining:.0f}. "
+                f"Price sensitivity: {self.price_sensitivity:.1f}/1 (higher=more price-conscious). "
+                f"Prefer reliable sellers with complete product information. Return ONLY valid JSON."
+            ),
+            user=(
+                f"Evaluate these products:\n{product_list}\n"
+                f"Return: {{\"shortlisted_skus\": [\"sku\"], "
+                f"\"has_question\": {'true' if ask_question else 'false'}, "
+                f"\"question\": \"optional question for merchant\"}}"
+            ),
         )
         if "error" in result or "shortlisted_skus" not in result:
             result = {"shortlisted_skus": [affordable[0]["sku"]], "has_question": False}
@@ -143,6 +282,13 @@ class ConsumerAgent(BaseAgent):
         if not self.shortlisted:
             self.shortlisted = affordable[:1]
 
+        if self.current_transaction:
+            self.current_transaction["shortlisted"] = [
+                {"sku": p["sku"], "name": p["name"], "merchant": p["merchant_name"]}
+                for p in self.shortlisted
+            ]
+        self._txn_step("considering", f"Shortlisted {len(self.shortlisted)} product(s)")
+
         if result.get("has_question") and result.get("question") and self.shortlisted:
             product = self.shortlisted[0]
             merchant_id = product.get("merchant_id")
@@ -150,39 +296,57 @@ class ConsumerAgent(BaseAgent):
                 await self.send_message(merchant_id, "question", {
                     "sku": product["sku"],
                     "question": result["question"],
-                })
+                    "transaction_id": self._txn_id(),
+                }, transaction_id=self._txn_id())
                 await self.emit_event(
                     "agent_question",
                     {"merchant": product.get("merchant_name"), "question": result["question"]},
-                    f"{self.name} asked {product.get('merchant_name', 'merchant')}: \"{result['question']}\"",
+                    f"{self.name} asked {product.get('merchant_name','merchant')}: \"{result['question']}\"",
+                    transaction_id=self._txn_id(),
+                    to_agent_id=merchant_id,
                 )
                 msg = await self.receive_message(timeout=6.0)
                 if msg and msg.message_type == "question_answer":
+                    self._txn_step("considering", f"Q&A: {result['question']} → {msg.content.get('answer','')}")
                     await self.emit_event(
                         "agent_answer",
                         {"answer": msg.content.get("answer", "")},
-                        f"{product.get('merchant_name', 'Merchant')} replied: \"{msg.content.get('answer', '')}\"",
+                        f"{product.get('merchant_name','Merchant')} replied: \"{msg.content.get('answer','')}\"",
+                        transaction_id=self._txn_id(),
                     )
 
         self.state = ConsumerState.CONVERTING
         await self.emit_event(
             "state_change",
             {"state": "converting", "shortlist": len(self.shortlisted)},
-            f"{self.name} narrowed down to {len(self.shortlisted)} option(s) — deciding now",
+            f"{self.name} narrowed to {len(self.shortlisted)} option(s) — deciding now",
+            transaction_id=self._txn_id(),
         )
+        await self._emit_transaction_update("converting")
 
+    # ── Conversion ──────────────────────────────────────────────
     async def _do_conversion(self):
         if not self.shortlisted:
+            self._end_transaction("abandoned")
             self.state = ConsumerState.IDLE
             return
 
+        remaining = self.budget - self.total_spent
         product_list = "\n".join(
-            f"- {p['name']} ${p['price']} from {p['merchant_name']}"
+            f"- {p['name']} ${p['price']:.2f} from {p['merchant_name']} "
+            f"[quality: {p.get('quality_score',100):.0f}/100]"
             for p in self.shortlisted
         )
         result = await self.call_llm(
-            system=f"You are {self.name}. {self.persona} Remaining budget: ${self.budget - self.total_spent:.0f}. Return ONLY valid JSON.",
-            user=f"Final decision:\n{product_list}\nReturn: {{\"decision\": \"buy\" or \"pass\", \"chosen_sku\": \"sku if buying\", \"reasoning\": \"one sentence\"}}",
+            system=(
+                f"You are {self.name}. {self.persona} "
+                f"Budget left: ${remaining:.0f}. "
+                f"Impulse tendency: {self.impulse_tendency:.1f}/1. Return ONLY valid JSON."
+            ),
+            user=(
+                f"Final decision:\n{product_list}\n"
+                f"Return: {{\"decision\": \"buy\" or \"pass\", \"chosen_sku\": \"sku if buying\", \"reasoning\": \"one sentence\"}}"
+            ),
         )
         if "error" in result:
             result = {"decision": "buy", "chosen_sku": self.shortlisted[0]["sku"], "reasoning": "looks good"}
@@ -192,7 +356,7 @@ class ConsumerAgent(BaseAgent):
                 (p for p in self.shortlisted if p.get("sku") == result.get("chosen_sku")),
                 self.shortlisted[0],
             )
-            if chosen["price"] <= (self.budget - self.total_spent):
+            if chosen["price"] <= remaining:
                 merchant_id = chosen.get("merchant_id")
                 if merchant_id:
                     await self.send_message(merchant_id, "place_order", {
@@ -200,18 +364,28 @@ class ConsumerAgent(BaseAgent):
                         "quantity": 1,
                         "price": chosen["price"],
                         "consumer_name": self.name,
-                    })
+                        "transaction_id": self._txn_id(),
+                    }, transaction_id=self._txn_id())
                     msg = await self.receive_message(timeout=6.0)
                     if msg and msg.message_type == "order_confirmation":
                         self.total_spent += chosen["price"]
-                        self.purchase_history.append({
+                        purchase = {
                             "sku": chosen["sku"],
                             "name": chosen["name"],
                             "merchant": chosen.get("merchant_name"),
                             "merchant_id": merchant_id,
                             "price": chosen["price"],
                             "order_id": msg.content.get("order_id"),
-                        })
+                            "transaction_id": self._txn_id(),
+                        }
+                        self.purchase_history.append(purchase)
+                        self._txn_step("completed", f"Purchased {chosen['name']} for ${chosen['price']:.2f}")
+                        self._end_transaction(
+                            "completed",
+                            final_product=chosen["name"],
+                            final_merchant=chosen.get("merchant_name"),
+                            total=chosen["price"],
+                        )
                         await self.emit_event(
                             "purchase_completed",
                             {
@@ -222,43 +396,48 @@ class ConsumerAgent(BaseAgent):
                                 "reasoning": result.get("reasoning", ""),
                             },
                             f"💰 {self.name} bought {chosen['name']} from {chosen.get('merchant_name')} for ${chosen['price']:.2f}",
+                            transaction_id=self._txn_id(),
                         )
                         self.state = ConsumerState.POST_PURCHASE
                         self.shortlisted = []
                         self.candidate_products = []
                         return
                     elif msg and msg.message_type == "order_rejected":
-                        await self.emit_event(
-                            "purchase_passed",
-                            {"reason": "out of stock"},
-                            f"{self.name} couldn't complete purchase — item out of stock",
-                        )
+                        self._txn_step("abandoned", "Item out of stock")
             else:
+                self._txn_step("abandoned", f"Over budget: ${chosen['price']:.2f} > ${remaining:.2f}")
                 await self.emit_event(
                     "budget_exceeded",
                     {"product": chosen["name"], "price": chosen["price"]},
                     f"{self.name} passed on {chosen['name']} — over remaining budget",
+                    transaction_id=self._txn_id(),
                 )
         else:
+            self._txn_step("abandoned", f"Decided not to buy: {result.get('reasoning','')}")
             await self.emit_event(
                 "purchase_passed",
                 {"reasoning": result.get("reasoning", "")},
-                f"{self.name} decided not to buy — {result.get('reasoning', 'passed')}",
+                f"{self.name} decided not to buy — {result.get('reasoning','passed')}",
+                transaction_id=self._txn_id(),
             )
 
+        self._end_transaction("abandoned")
         self.state = ConsumerState.IDLE
         self.shortlisted = []
         self.candidate_products = []
 
+    # ── Post-purchase ───────────────────────────────────────────
     async def _do_post_purchase(self):
         if not self.purchase_history:
             self.state = ConsumerState.IDLE
             return
-
         last = self.purchase_history[-1]
         result = await self.call_llm(
             system=f"You are {self.name}. {self.persona} Return ONLY valid JSON.",
-            user=f"You just bought {last['name']} from {last['merchant']} for ${last['price']}. Write a short review. Return: {{\"rating\": 1-5, \"review\": \"1-2 sentence review\"}}",
+            user=(
+                f"You just bought {last['name']} from {last['merchant']} for ${last['price']}. "
+                f"Write a short review. Return: {{\"rating\": 1-5, \"review\": \"1-2 sentence review\"}}"
+            ),
         )
         if "error" in result:
             result = {"rating": 4, "review": "Good product, happy with my purchase!"}
@@ -271,7 +450,6 @@ class ConsumerAgent(BaseAgent):
                 "review": result.get("review", ""),
                 "consumer_name": self.name,
             })
-
         await self.emit_event(
             "review_posted",
             {
@@ -280,9 +458,33 @@ class ConsumerAgent(BaseAgent):
                 "rating": result.get("rating", 4),
                 "review": result.get("review", ""),
             },
-            f"⭐ {self.name} left {result.get('rating', 4)}/5 for {last['name']}: \"{result.get('review', '')}\"",
+            f"⭐ {self.name} left {result.get('rating',4)}/5 for {last['name']}: \"{result.get('review','')}\"",
+            transaction_id=last.get("transaction_id"),
         )
-
         self.state = ConsumerState.IDLE
         self.shortlisted = []
         self.candidate_products = []
+
+    # ── Helpers ──────────────────────────────────────────────────
+    def _end_transaction(self, status: str, final_product=None, final_merchant=None, total=None):
+        from datetime import datetime
+        if not self.current_transaction:
+            return
+        self.current_transaction["status"] = status
+        self.current_transaction["completed_at"] = datetime.utcnow().isoformat()
+        if final_product:
+            self.current_transaction["final_product"] = final_product
+        if final_merchant:
+            self.current_transaction["final_merchant"] = final_merchant
+        if total is not None:
+            self.current_transaction["total"] = total
+
+    async def _emit_transaction_update(self, status: str):
+        if not self.current_transaction:
+            return
+        await self.emit_event(
+            "transaction_update",
+            {"transaction": dict(self.current_transaction), "status": status},
+            "",
+            transaction_id=self._txn_id(),
+        )

@@ -21,6 +21,21 @@ EVENT_COLORS = {
     "supply_order_sent": "#f97316",
     "supply_order_fulfilled": "#84cc16",
     "supply_received": "#a3e635",
+    "transaction_update": "#60a5fa",
+    "quality_warning": "#fbbf24",
+    "network_message": "#475569",
+}
+
+FILTER_CATEGORIES = {
+    "all": None,
+    "transactions": {
+        "state_change", "product_query", "agent_question", "agent_answer",
+        "purchase_completed", "purchase_passed", "budget_exceeded", "review_posted",
+        "transaction_update",
+    },
+    "purchases": {"purchase_completed"},
+    "supply": {"supply_order_sent", "supply_order_fulfilled", "supply_received", "out_of_stock"},
+    "reviews": {"review_posted", "review_received"},
 }
 
 STATE_COLORS = {
@@ -39,10 +54,13 @@ class SimEvent(BaseModel):
     agent_id: Optional[str] = None
     agent_name: Optional[str] = None
     agent_type: Optional[str] = None
+    from_agent_id: Optional[str] = None
+    to_agent_id: Optional[str] = None
+    transaction_id: Optional[str] = None
     data: dict = {}
     message: str = ""
     color: str = "#6b7280"
 
     def model_post_init(self, __context):
-        if not self.color or self.color == "#6b7280":
+        if self.color == "#6b7280":
             self.color = EVENT_COLORS.get(self.event_type, "#6b7280")
