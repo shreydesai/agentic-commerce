@@ -72,6 +72,17 @@ def _fake_product_response(from_id, to_id, sku="E2E-001", price=49.99, stock=20)
     )
 
 
+def _fake_discovery_pong(from_id, to_id, can_serve=True):
+    """Simulates the merchant capability response to a discovery_ping."""
+    return AgentMessage(
+        from_agent_id=from_id,
+        to_agent_id=to_id,
+        message_type="discovery_pong",
+        content={"can_serve": can_serve, "quality_score": 90.0, "quality_tier": "excellent",
+                 "vertical": "electronics", "merchant_name": "E2EStore"},
+    )
+
+
 # ── Flow 1: Full purchase lifecycle ──────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -79,12 +90,13 @@ async def test_full_purchase_flow(event_bus, message_bus):
     """Consumer discovers, considers, converts, and posts a review end-to-end."""
     consumer, biz, consumer_q, biz_q = _make_pair(event_bus, message_bus)
 
-    # 1. Discovery — pre-populate consumer inbox with fake product response
-    #    _do_discovery() sends queries to biz (sit unread), sleep(2), reads consumer_q
-    consumer_q.put_nowait(_fake_product_response("biz_e2e", "consumer_e2e"))
+    # 1. Discovery — seed inbox with pong + product response (discovery ping/pong phase)
     discover_llm = {"category": "electronics", "query": "widget", "max_price": 100.0}
     with patch.object(consumer, "call_llm", AsyncMock(return_value=discover_llm)):
         await consumer._start_discovery()
+        # Pong must arrive before product_response (ping fires first, then product_query)
+        consumer_q.put_nowait(_fake_discovery_pong("biz_e2e", "consumer_e2e"))
+        consumer_q.put_nowait(_fake_product_response("biz_e2e", "consumer_e2e"))
         await consumer._do_discovery()
 
     assert consumer.state == ConsumerState.CONSIDERING
@@ -109,10 +121,14 @@ async def test_full_purchase_flow(event_bus, message_bus):
     with patch.object(consumer, "call_llm", AsyncMock(return_value=convert_llm)):
         await consumer._do_conversion()
 
-    assert consumer.state == ConsumerState.POST_PURCHASE
+    # Consumer now waits for delivery notice before reviewing
+    assert consumer.state == ConsumerState.AWAITING_DELIVERY
     assert consumer.total_spent == pytest.approx(49.99)
     assert len(consumer.purchase_history) == 1
     assert consumer.purchase_history[0]["sku"] == "E2E-001"
+
+    # Simulate delivery arriving → advance to POST_PURCHASE
+    consumer.state = ConsumerState.POST_PURCHASE
 
     # 4. Post-purchase review
     review_llm = {"rating": 5, "review": "Excellent product!"}
@@ -140,10 +156,11 @@ async def test_purchase_events_emitted(event_bus, message_bus):
     """Full purchase flow emits purchase_completed and transaction events."""
     consumer, biz, consumer_q, biz_q = _make_pair(event_bus, message_bus)
 
-    consumer_q.put_nowait(_fake_product_response("biz_e2e", "consumer_e2e"))
     discover_llm = {"category": "electronics", "query": "widget", "max_price": 100.0}
     with patch.object(consumer, "call_llm", AsyncMock(return_value=discover_llm)):
         await consumer._start_discovery()
+        consumer_q.put_nowait(_fake_discovery_pong("biz_e2e", "consumer_e2e"))
+        consumer_q.put_nowait(_fake_product_response("biz_e2e", "consumer_e2e"))
         await consumer._do_discovery()
 
     consider_llm = {"shortlisted_skus": ["E2E-001"], "has_question": False}

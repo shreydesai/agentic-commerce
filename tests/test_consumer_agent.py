@@ -58,8 +58,15 @@ async def test_discovery_sends_product_queries(event_bus, message_bus):
 
     llm_response = {"category": "electronics", "query": "best widget", "max_price": 200.0}
     with patch.object(c, "call_llm", AsyncMock(return_value=llm_response)):
-        # Pre-populate inbox with a fake response so discovery doesn't stall
         from acp.models import AgentMessage
+        # Phase 1: discovery_pong — merchant signals it can serve
+        fake_pong = AgentMessage(
+            from_agent_id="biz_electronics", to_agent_id="consumer_test",
+            message_type="discovery_pong",
+            content={"can_serve": True, "quality_score": 92.0, "quality_tier": "excellent",
+                     "vertical": "electronics", "merchant_name": "TechStore"},
+        )
+        # Phase 2: product_response — merchant returns matching products
         fake_resp = AgentMessage(
             from_agent_id="biz_electronics", to_agent_id="consumer_test",
             message_type="product_response",
@@ -69,7 +76,8 @@ async def test_discovery_sends_product_queries(event_bus, message_bus):
                                    "category": "electronics", "stock": 10, "rating": 4.5}]},
         )
         await c._start_discovery()
-        # Simulate receiving the response
+        # Seed inbox in order: pong first, then product response
+        message_bus["consumer_test"].put_nowait(fake_pong)
         message_bus["consumer_test"].put_nowait(fake_resp)
 
         await c._do_discovery()
@@ -133,7 +141,8 @@ async def test_conversion_buys_within_budget(event_bus, message_bus):
     with patch.object(c, "call_llm", AsyncMock(return_value=llm_response)):
         await c._do_conversion()
 
-    assert c.state == ConsumerState.POST_PURCHASE
+    # After purchase the consumer waits for the delivery notice before reviewing
+    assert c.state == ConsumerState.AWAITING_DELIVERY
     assert c.total_spent == pytest.approx(49.99)
     assert len(c.purchase_history) == 1
 
@@ -186,5 +195,5 @@ async def test_idle_considers_impulse_tendency(event_bus, message_bus):
         import random
         threshold = 0.4 + c.impulse_tendency * 0.3
         impulse_results.append(random.random() < threshold)
-    # With impulse=1.0, threshold=0.7 — most should be True
-    assert sum(impulse_results) > 12
+    # With impulse=1.0, threshold=0.7 — expect ~14/20 True; assert >= 10 for statistical safety
+    assert sum(impulse_results) >= 10

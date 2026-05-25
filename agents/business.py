@@ -217,7 +217,9 @@ class BusinessAgent(BaseAgent):
 
     async def _handle_message(self, msg):
         mtype = msg.message_type
-        if mtype == "product_query":
+        if mtype == "discovery_ping":
+            await self._handle_discovery_ping(msg)
+        elif mtype == "product_query":
             await self._handle_product_query(msg)
         elif mtype == "question":
             await self._handle_question(msg)
@@ -229,10 +231,48 @@ class BusinessAgent(BaseAgent):
             asyncio.create_task(self._handle_supply_order(msg))
         elif mtype == "supply_confirmation":
             await self._handle_supply_confirmation(msg)
-        elif mtype == "negotiation_request":
+        elif mtype in ("negotiation_request", "negotiation_bid"):
             asyncio.create_task(self._handle_negotiation_request(msg))
         elif mtype == "negotiation_accept":
             pass  # Consumer will send a place_order at the agreed price; nothing to do here
+
+    # ── B2C: discovery ping (attention economy handshake) ───────
+    async def _handle_discovery_ping(self, msg):
+        """Pure rule-based capability response — no LLM, instant.
+
+        The consumer uses this to decide whether to send a full product_query.
+        Merchants with no matching inventory or poor quality don't earn a query.
+        """
+        category = msg.content.get("category", "")
+        max_price = msg.content.get("max_price", 9999)
+        txn_id = msg.content.get("transaction_id")
+
+        # Check whether we have any in-stock, price-eligible product for this category
+        can_serve = any(
+            self.inventory.get(sku, 0) > 0
+            and 0 < p.get("price", 0) <= max_price
+            and (
+                p.get("category", "").lower() == category.lower()
+                or self.vertical.lower() == category.lower()
+            )
+            for sku, p in self.catalog.items()
+        )
+
+        quality_tier = (
+            "excellent" if self.quality_score >= 85 else
+            "good"      if self.quality_score >= 70 else
+            "fair"      if self.quality_score >= 50 else
+            "poor"
+        )
+
+        await self.send_message(msg.from_agent_id, "discovery_pong", {
+            "can_serve": can_serve,
+            "quality_score": self.quality_score,
+            "quality_tier": quality_tier,
+            "vertical": self.vertical,
+            "merchant_name": self.name,
+            "transaction_id": txn_id,
+        }, transaction_id=txn_id)
 
     # ── B2C: product query ──────────────────────────────────────
     async def _handle_product_query(self, msg):
@@ -304,6 +344,10 @@ class BusinessAgent(BaseAgent):
                 transaction_id=txn_id,
                 to_agent_id=msg.from_agent_id,
             )
+            # Schedule delivery notice — simulates real-world dispatch-to-delivery delay
+            asyncio.create_task(
+                self._send_delivery_notice(msg.from_agent_id, order, txn_id)
+            )
             if self.inventory[sku] <= LOW_INVENTORY_THRESHOLD and self.supplier_ids:
                 await self._reorder_from_supplier(sku)
         else:
@@ -316,6 +360,26 @@ class BusinessAgent(BaseAgent):
                 {"sku": sku, "product": self.catalog.get(sku, {}).get("name", sku)},
                 f"⚠️ {self.name} is out of stock: {self.catalog.get(sku,{}).get('name',sku)}",
             )
+
+    async def _send_delivery_notice(self, consumer_id: str, order: dict, txn_id: Optional[str]):
+        """Send delivery_notice after a simulated dispatch delay (3–8 s at 1x speed)."""
+        delay = random.uniform(3, 8) / max(config.SIMULATION_SPEED_FACTOR, 0.25)
+        await asyncio.sleep(delay)
+        product_name = order.get("product_name", order.get("sku", "your order"))
+        await self.send_message(consumer_id, "delivery_notice", {
+            "order_id": order["order_id"],
+            "sku": order.get("sku", ""),
+            "product_name": product_name,
+            "merchant_name": self.name,
+            "transaction_id": txn_id,
+        }, transaction_id=txn_id)
+        await self.emit_event(
+            "delivery_notice_sent",
+            {"order_id": order["order_id"], "product": product_name},
+            f"🚚 {self.name} sent delivery notice for order {order['order_id']}",
+            transaction_id=txn_id,
+            to_agent_id=consumer_id,
+        )
 
     async def _proactive_restock(self):
         """Scan inventory and reorder any SKU at or below threshold."""
@@ -501,11 +565,18 @@ class BusinessAgent(BaseAgent):
             pass
 
     async def _handle_negotiation_request(self, msg):
-        """LLM decides whether to accept, counter, or decline a price negotiation."""
+        """LLM decides whether to accept, counter, or decline a price negotiation.
+
+        Handles both initial `negotiation_request` and subsequent `negotiation_bid` messages.
+        The `round` field tracks which round we're on (1-3); `is_final` signals the consumer's
+        last chance — we should be more likely to close on the final round.
+        """
         sku = msg.content.get("sku")
         preferred_price = msg.content.get("preferred_price", 0)
         max_price = msg.content.get("max_price", 0)
         txn_id = msg.content.get("transaction_id")
+        negotiation_round = msg.content.get("round", 1)
+        is_final = msg.content.get("is_final", False)
 
         product = self.catalog.get(sku, {})
         if not product:
@@ -526,10 +597,12 @@ class BusinessAgent(BaseAgent):
                     f"You are the sales agent for {self.name}. Make a negotiation decision. Return ONLY valid JSON."
                 ),
                 user=(
-                    f"Customer wants to buy '{product.get('name', sku)}' (listed at ${current_price:.2f}). "
-                    f"They prefer ${preferred_price:.2f}, max ${max_price:.2f}. "
+                    f"{'[FINAL ROUND] ' if is_final else ''}Round {negotiation_round}/3. "
+                    f"Customer wants '{product.get('name', sku)}' (listed ${current_price:.2f}). "
+                    f"Their bid: ${preferred_price:.2f}, max they'll pay: ${max_price:.2f}. "
                     f"Inventory: {inv} units. Conversion rate: {conversion_rate:.0%}. "
-                    f"Floor price (don't go below): ${floor_price:.2f}. "
+                    f"Floor price (never go below): ${floor_price:.2f}. "
+                    f"{'On final round, prefer accept over counter if bid >= floor.' if is_final else ''} "
                     f"Return: {{\"action\": \"accept\" or \"counter\" or \"decline\", "
                     f"\"offered_price\": <price if accept/counter>, "
                     f"\"reason\": \"brief\"}}"
@@ -540,6 +613,10 @@ class BusinessAgent(BaseAgent):
             # Safety: clamp to floor
             offered_price = max(floor_price, min(current_price, round(float(offered_price), 2)))
 
+            # On the final round, force a resolution — counter becomes accept at our best price
+            if is_final and action == "counter":
+                action = "accept"
+
             if action in ("accept", "counter"):
                 await self.send_message(msg.from_agent_id, "counter_offer", {
                     "sku": sku,
@@ -547,27 +624,31 @@ class BusinessAgent(BaseAgent):
                     "offered_price": offered_price,
                     "original_price": current_price,
                     "offer_type": action,
+                    "round": negotiation_round,
                     "reason": result.get("reason", ""),
                 }, transaction_id=txn_id)
             else:
                 await self.send_message(msg.from_agent_id, "negotiation_decline", {
                     "sku": sku,
                     "transaction_id": txn_id,
+                    "round": negotiation_round,
                     "reason": result.get("reason", "Price is firm"),
                 }, transaction_id=txn_id)
         except Exception:
             # Fallback: make a simple rule-based decision
             if inv > 15 and preferred_price >= floor_price:
-                # Plenty of stock, accept a reasonable offer
+                # Plenty of stock — meet somewhere reasonable
                 offered_price = max(floor_price, min(current_price, preferred_price))
                 await self.send_message(msg.from_agent_id, "counter_offer", {
                     "sku": sku, "transaction_id": txn_id,
                     "offered_price": offered_price, "original_price": current_price,
-                    "offer_type": "counter", "reason": "Happy to help",
+                    "offer_type": "accept" if is_final else "counter",
+                    "round": negotiation_round, "reason": "Happy to help",
                 }, transaction_id=txn_id)
             else:
                 await self.send_message(msg.from_agent_id, "negotiation_decline", {
-                    "sku": sku, "transaction_id": txn_id, "reason": "Price is firm at this stock level",
+                    "sku": sku, "transaction_id": txn_id,
+                    "round": negotiation_round, "reason": "Price is firm at this stock level",
                 }, transaction_id=txn_id)
 
     async def _reorder_from_supplier(self, sku: str):

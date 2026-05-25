@@ -13,6 +13,7 @@ class ConsumerState(Enum):
     DISCOVERING = "discovering"
     CONSIDERING = "considering"
     CONVERTING = "converting"
+    AWAITING_DELIVERY = "awaiting_delivery"
     POST_PURCHASE = "post_purchase"
 
 
@@ -72,6 +73,9 @@ class ConsumerAgent(BaseAgent):
         self.current_transaction: Optional[dict] = None
         self.candidate_products: list[dict] = []
         self.shortlisted: list[dict] = []
+        # Delivery tracking (AWAITING_DELIVERY state)
+        self._delivery_wait_ticks: int = 0
+        self._awaiting_order_info: Optional[dict] = None
 
     # ── Serialization ───────────────────────────────────────────
     def get_state_dict(self) -> dict:
@@ -177,6 +181,8 @@ class ConsumerAgent(BaseAgent):
             await self._do_consideration()
         elif self.state == ConsumerState.CONVERTING:
             await self._do_conversion()
+        elif self.state == ConsumerState.AWAITING_DELIVERY:
+            await self._do_awaiting_delivery()
         elif self.state == ConsumerState.POST_PURCHASE:
             await self._do_post_purchase()
 
@@ -250,34 +256,81 @@ class ConsumerAgent(BaseAgent):
         if self.current_transaction:
             self.current_transaction["shopping_intent"] = result.get("shopping_intent", "exploring")
 
-        self._txn_step("discovering", f"Searching for: {result.get('query','')} (category: {result.get('category','')})")
+        category = result.get("category", "")
+        max_price = result.get("max_price", remaining)
+        self._txn_step("discovering", f"Searching for: {result.get('query','')} (category: {category})")
 
-        # Find relevant B2C businesses, excluding merchants blocked after bad experiences
-        relevant = [
+        # ── Attention Economy: quality-threshold gate ────────────
+        # Research-depth determines how selective the consumer is.
+        # High research_depth → strict quality bar (up to 75/100).
+        # Impulse buyers (low research_depth) → looser bar (down to 35/100).
+        min_quality = max(35, 35 + round(self.research_depth * 40))
+
+        all_in_vertical = [
             b for b in self.business_registry.values()
             if b.business_type == "B2C"
             and b.agent_id not in self.blocked_merchants
-            and (b.vertical == result.get("category", "") or b.vertical in self.shopping_interests)
+            and (b.vertical == category or b.vertical in self.shopping_interests)
         ]
-        if not relevant:
-            # Fall back to any unblocked B2C merchant
-            relevant = [
+        if not all_in_vertical:
+            all_in_vertical = [
                 b for b in self.business_registry.values()
                 if b.business_type == "B2C" and b.agent_id not in self.blocked_merchants
             ]
+
+        # Filter merchants below the quality threshold — they don't even get a ping
+        ping_targets = [b for b in all_in_vertical if b.quality_score >= min_quality]
+        gated_out = len(all_in_vertical) - len(ping_targets)
+        if not ping_targets:
+            # Fallback: contact the best available merchants even if all are below threshold
+            ping_targets = sorted(all_in_vertical, key=lambda b: b.quality_score, reverse=True)[:3]
+            gated_out = 0
+
+        if gated_out > 0:
+            await self.emit_event(
+                "attention_gate",
+                {"min_quality": min_quality, "gated_out": gated_out,
+                 "pinged": len(ping_targets), "research_depth": round(self.research_depth, 2)},
+                f"🔍 {self.name} attention gate ({min_quality}/100): "
+                f"{gated_out} merchant(s) below threshold, {len(ping_targets)} eligible",
+                transaction_id=self._txn_id(),
+            )
+
+        # ── Phase 1: Discovery ping — lightweight capability check ─
+        # Merchant responds with can_serve flag + quality tier (no LLM, instant).
+        for biz in ping_targets:
+            await self.send_message(biz.agent_id, "discovery_ping", {
+                "category": category,
+                "max_price": max_price,
+                "transaction_id": self._txn_id(),
+            }, transaction_id=self._txn_id())
+
+        await asyncio.sleep(1)
+
+        capable_merchants: dict[str, dict] = {}
+        for _ in range(len(ping_targets)):
+            msg = await self.receive_message(timeout=2.0)
+            if msg and msg.message_type == "discovery_pong":
+                capable_merchants[msg.from_agent_id] = msg.content
+
+        # Only query merchants who confirmed they can serve
+        eligible = [b for b in ping_targets if capable_merchants.get(b.agent_id, {}).get("can_serve", False)]
+        if not eligible:
+            eligible = ping_targets  # fallback: query all pinged if none confirmed capability
+
         # High research_depth consumers shop around more; low research_depth consumers pick fast
-        max_contacts = max(1, min(len(relevant), 1 + round(self.research_depth * (len(relevant) - 1))))
-        selected = random.sample(relevant, max_contacts)
+        max_contacts = max(1, min(len(eligible), 1 + round(self.research_depth * (len(eligible) - 1))))
+        selected = random.sample(eligible, min(max_contacts, len(eligible)))
 
         self.candidate_products = []
-        # Fire all queries first (non-blocking), then collect responses
+        # ── Phase 2: Full product queries to selected merchants ────
         for biz in selected:
             if biz.agent_id not in (self.current_transaction or {}).get("businesses_contacted", []):
                 (self.current_transaction or {}).setdefault("businesses_contacted", []).append(biz.agent_id)
             await self.send_message(biz.agent_id, "product_query", {
                 "query": result.get("query", ""),
-                "category": result.get("category", ""),
-                "max_price": result.get("max_price", remaining),
+                "category": category,
+                "max_price": max_price,
                 "transaction_id": self._txn_id(),
             }, transaction_id=self._txn_id())
             await self.emit_event(
@@ -468,8 +521,9 @@ class ConsumerAgent(BaseAgent):
             if chosen["price"] <= remaining:
                 merchant_id = chosen.get("merchant_id")
 
-                # Attempt negotiation if consumer is price-sensitive and price seems high
-                # preferred_price is 80% of max_price from discovery (approximated as 90% of listed price)
+                # ── Multi-round negotiation (max 3 rounds) ─────────────
+                # Price-sensitive + research-driven consumers open a bid/ask loop.
+                # Each side can revise up to 3 times before a final decision is forced.
                 preferred_price = round(chosen["price"] * 0.88, 2)
                 should_negotiate = (
                     self.price_sensitivity > 0.52
@@ -478,32 +532,65 @@ class ConsumerAgent(BaseAgent):
                     and merchant_id is not None
                 )
                 agreed_price = chosen["price"]  # default to full price
+
                 if should_negotiate:
-                    await self.send_message(merchant_id, "negotiation_request", {
-                        "sku": chosen["sku"],
-                        "preferred_price": preferred_price,
-                        "max_price": chosen["price"],
-                        "transaction_id": self._txn_id(),
-                        "reason": f"Budget-conscious — hoping for a small discount",
-                    }, transaction_id=self._txn_id())
-                    self._txn_step("negotiating", f"Requested discount: ${chosen['price']:.2f} → ${preferred_price:.2f} preferred")
-                    neg_msg = await self.receive_message(timeout=5.0)
-                    if neg_msg and neg_msg.message_type == "counter_offer":
-                        offered = neg_msg.content.get("offered_price", chosen["price"])
-                        if offered <= chosen["price"]:  # any reduction is acceptable
-                            # Accept the counter-offer
-                            await self.send_message(merchant_id, "negotiation_accept", {
-                                "sku": chosen["sku"],
-                                "transaction_id": self._txn_id(),
-                                "agreed_price": offered,
-                            }, transaction_id=self._txn_id())
-                            agreed_price = offered
-                            self._txn_step("negotiating", f"Accepted counter-offer: ${offered:.2f} (saved ${chosen['price']-offered:.2f})")
+                    MAX_NEG_ROUNDS = 3
+                    current_bid = preferred_price
+                    negotiation_round = 0
+                    negotiated = False
+
+                    while negotiation_round < MAX_NEG_ROUNDS and not negotiated:
+                        negotiation_round += 1
+                        is_final = (negotiation_round >= MAX_NEG_ROUNDS)
+                        msg_type = "negotiation_request" if negotiation_round == 1 else "negotiation_bid"
+
+                        await self.send_message(merchant_id, msg_type, {
+                            "sku": chosen["sku"],
+                            "preferred_price": current_bid,
+                            "max_price": chosen["price"],
+                            "transaction_id": self._txn_id(),
+                            "reason": "Budget-conscious — seeking best value",
+                            "round": negotiation_round,
+                            "is_final": is_final,
+                        }, transaction_id=self._txn_id())
+                        self._txn_step("negotiating",
+                            f"Round {negotiation_round}/{MAX_NEG_ROUNDS}: bid ${current_bid:.2f} "
+                            f"(listed ${chosen['price']:.2f}){' [final]' if is_final else ''}")
+
+                        neg_msg = await self.receive_message(timeout=5.0)
+                        if neg_msg and neg_msg.message_type == "counter_offer":
+                            offered = min(neg_msg.content.get("offered_price", chosen["price"]), chosen["price"])
+                            # Accept if: it's the final round, or they came close enough to our bid
+                            worth_countering = (
+                                not is_final
+                                and offered > current_bid * 1.03  # gap > 3% → worth another round
+                            )
+                            if worth_countering:
+                                # Split-the-difference for next bid
+                                current_bid = round((current_bid + offered) / 2, 2)
+                                self._txn_step("negotiating",
+                                    f"Round {negotiation_round}: counter ${offered:.2f} — "
+                                    f"bidding ${current_bid:.2f} next round")
+                                # loop continues with negotiation_bid
+                            else:
+                                # Accept the counter
+                                await self.send_message(merchant_id, "negotiation_accept", {
+                                    "sku": chosen["sku"],
+                                    "transaction_id": self._txn_id(),
+                                    "agreed_price": offered,
+                                }, transaction_id=self._txn_id())
+                                agreed_price = offered
+                                negotiated = True
+                                self._txn_step("negotiating",
+                                    f"Accepted after {negotiation_round} round(s): "
+                                    f"${offered:.2f} (saved ${chosen['price'] - offered:.2f})")
+                        elif neg_msg and neg_msg.message_type == "negotiation_decline":
+                            self._txn_step("negotiating",
+                                f"Merchant declined at round {negotiation_round} — proceeding at full price")
+                            break
                         else:
-                            self._txn_step("negotiating", "Counter too high, proceeding at full price")
-                    elif neg_msg and neg_msg.message_type == "negotiation_decline":
-                        self._txn_step("negotiating", "Merchant declined — proceeding at full price")
-                    # If timeout or no response, proceed at full price (agreed_price stays as chosen["price"])
+                            # Timeout or unexpected message — abort negotiation
+                            break
 
                 if merchant_id:
                     await self.send_message(merchant_id, "place_order", {
@@ -516,6 +603,7 @@ class ConsumerAgent(BaseAgent):
                     msg = await self.receive_message(timeout=6.0)
                     if msg and msg.message_type == "order_confirmation":
                         self.total_spent += agreed_price
+                        order_id = msg.content.get("order_id")
                         purchase = {
                             "sku": chosen["sku"],
                             "name": chosen["name"],
@@ -524,7 +612,7 @@ class ConsumerAgent(BaseAgent):
                             "price": agreed_price,
                             "quality_score": chosen.get("quality_score", 100),
                             "has_quality_issues": chosen.get("has_quality_issues", False),
-                            "order_id": msg.content.get("order_id"),
+                            "order_id": order_id,
                             "transaction_id": self._txn_id(),
                         }
                         self.purchase_history.append(purchase)
@@ -542,13 +630,21 @@ class ConsumerAgent(BaseAgent):
                                 "product": chosen["name"],
                                 "merchant": chosen.get("merchant_name"),
                                 "price": agreed_price,
-                                "order_id": msg.content.get("order_id"),
+                                "order_id": order_id,
                                 "reasoning": result.get("reasoning", ""),
                             },
                             f"💰 {self.name} bought {chosen['name']} from {chosen.get('merchant_name')} for ${agreed_price:.2f}",
                             transaction_id=self._txn_id(),
                         )
-                        self.state = ConsumerState.POST_PURCHASE
+                        # Transition to AWAITING_DELIVERY — review fires after delivery notice
+                        self._txn_step("awaiting_delivery", f"Waiting for delivery of order {order_id}")
+                        self._awaiting_order_info = {
+                            "order_id": order_id,
+                            "merchant_id": merchant_id,
+                            "merchant_name": chosen.get("merchant_name"),
+                        }
+                        self._delivery_wait_ticks = 0
+                        self.state = ConsumerState.AWAITING_DELIVERY
                         self.shortlisted = []
                         self.candidate_products = []
                         return
@@ -576,6 +672,39 @@ class ConsumerAgent(BaseAgent):
         self.state = ConsumerState.IDLE
         self.shortlisted = []
         self.candidate_products = []
+
+    # ── Awaiting delivery ────────────────────────────────────────
+    async def _do_awaiting_delivery(self):
+        """Poll for delivery_notice from merchant. Timeout after ~6 ticks → assume delivered."""
+        self._delivery_wait_ticks += 1
+
+        msg = await self.receive_message(timeout=0.5)
+        if msg and msg.message_type == "delivery_notice":
+            order_id = msg.content.get("order_id", "")
+            merchant_name = msg.content.get("merchant_name", "Merchant")
+            self._txn_step("delivered", f"Delivery confirmed: {merchant_name} — order {order_id}")
+            await self.emit_event(
+                "delivery_confirmed",
+                {"order_id": order_id, "merchant": merchant_name},
+                f"📬 {self.name} received delivery: order {order_id} from {merchant_name}",
+                transaction_id=self._txn_id(),
+            )
+            self._delivery_wait_ticks = 0
+            self._awaiting_order_info = None
+            self.state = ConsumerState.POST_PURCHASE
+        elif self._delivery_wait_ticks >= 6:
+            # Timeout — assume delivered, proceed to review
+            order_info = self._awaiting_order_info or {}
+            self._txn_step("delivered", "Delivery assumed (notice not received in time)")
+            await self.emit_event(
+                "delivery_timeout",
+                {"order_info": order_info, "ticks_waited": self._delivery_wait_ticks},
+                f"⏱️ {self.name} assumed delivery after timeout — proceeding to review",
+                transaction_id=self._txn_id(),
+            )
+            self._delivery_wait_ticks = 0
+            self._awaiting_order_info = None
+            self.state = ConsumerState.POST_PURCHASE
 
     # ── Post-purchase ───────────────────────────────────────────
     async def _do_post_purchase(self):

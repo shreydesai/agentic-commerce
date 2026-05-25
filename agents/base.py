@@ -75,9 +75,15 @@ class BaseAgent:
 
         # Emit network visualization event for key messages
         if emit_network and message_type in {
-            "product_query", "place_order", "question", "supply_order",
-            "product_response", "order_confirmation", "question_answer",
-            "supply_confirmation", "review", "order_rejected",
+            "discovery_ping", "discovery_pong",
+            "product_query", "product_response",
+            "place_order", "order_confirmation", "order_rejected",
+            "delivery_notice",
+            "question", "question_answer",
+            "negotiation_request", "negotiation_bid", "counter_offer",
+            "negotiation_accept", "negotiation_decline",
+            "supply_order", "supply_confirmation",
+            "review",
         }:
             await self.emit_event(
                 "network_message",
