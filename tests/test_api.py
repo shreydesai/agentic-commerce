@@ -658,7 +658,7 @@ class TestTransactionFinalStatus:
         After starting the sim, transaction_update events must eventually carry
         a final status ('completed' or 'abandoned'), not just intermediate ones.
         """
-        import time; time.sleep(2)
+        import time; time.sleep(0.5)
         with started_client.websocket_connect("/ws") as ws:
             # Drain initial state + history
             for _ in range(3):
@@ -686,7 +686,7 @@ class TestTransactionFinalStatus:
         Without _emit_transaction_update, the record would be incomplete.
         Supply transactions have their own status values (supply_ordered).
         """
-        import time; time.sleep(1)
+        import time; time.sleep(0.3)
         txns = started_client.get("/api/transactions").json()["transactions"]
         valid_statuses = {
             "discovering", "considering", "converting", "completed", "abandoned",
@@ -770,7 +770,7 @@ class TestMessagesEndpoint:
 
     def test_messages_have_required_fields(self, started_client):
         """Any messages present after starting must have the fields the UI reads."""
-        import time; time.sleep(1)
+        import time; time.sleep(0.3)
         msgs = started_client.get("/api/messages").json()["messages"]
         for m in msgs:
             assert "event_type" in m, f"Message missing event_type: {m}"
@@ -788,7 +788,7 @@ class TestSupplyTransactions:
 
     def test_supply_txn_status_values_valid(self, started_client):
         """All transaction statuses must be in the known set (including supply_ordered)."""
-        import time; time.sleep(1)
+        import time; time.sleep(0.3)
         txns = started_client.get("/api/transactions").json()["transactions"]
         valid = {
             "discovering", "considering", "converting", "completed", "abandoned",
@@ -800,7 +800,7 @@ class TestSupplyTransactions:
 
     def test_supply_txns_have_required_fields(self, started_client):
         """Supply transactions must have type, consumer_name, sku, quantity, status."""
-        import time; time.sleep(1)
+        import time; time.sleep(0.3)
         txns = started_client.get("/api/transactions").json()["transactions"]
         supply_txns = [t for t in txns if t.get("type") == "supply"]
         for txn in supply_txns:

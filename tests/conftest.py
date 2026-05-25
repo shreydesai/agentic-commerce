@@ -10,6 +10,34 @@ def event_loop():
     loop.close()
 
 
+@pytest.fixture(autouse=True)
+def fast_asyncio_sleep(monkeypatch):
+    """
+    Replace asyncio.sleep with an instant yield in every test.
+
+    Agent code uses asyncio.sleep for two purposes:
+      1. Simulation realism (consumer tick pacing, supplier delay, discovery wait)
+      2. Letting other coroutines run (cooperative multitasking)
+
+    In tests we only need (2). asyncio.sleep(0) satisfies that — it yields
+    control to the event loop without actually waiting — so tests that call
+    _do_discovery(), _handle_supply_order(), etc. finish in milliseconds
+    instead of 2-5 seconds each.
+
+    API tests that use `started_client` still rely on time.sleep() for their
+    own polling waits, which are unaffected by this patch.
+    """
+    async def _yield(delay=0, *args, **kwargs):
+        await asyncio.sleep.__wrapped__(0)   # yield without blocking
+
+    # Wrap asyncio.sleep so we can call the real sleep(0) inside the mock
+    import asyncio as _asyncio
+    _real_sleep = _asyncio.sleep
+    _yield.__wrapped__ = _real_sleep
+
+    monkeypatch.setattr(_asyncio, "sleep", _yield)
+
+
 @pytest.fixture
 def event_bus():
     return asyncio.Queue()

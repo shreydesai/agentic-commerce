@@ -235,6 +235,28 @@ header { display: flex; align-items: center; gap: 12px; padding: 0 14px; height:
 .cs-amt { font-size: 10px; color: var(--muted); white-space: nowrap; }
 .strategy-note { font-size: 11px; color: var(--text); padding: 3px 0; border-left: 2px solid var(--accent); padding-left: 6px; margin-bottom: 3px; line-height: 1.4; }
 
+/* ── Infrastructure analytics ── */
+.infra-section { grid-column: 1 / -1; }
+.infra-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.infra-card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; }
+.infra-card-title { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 8px; }
+.infra-stat-row { display: flex; justify-content: space-between; align-items: center; padding: 2px 0; font-size: 11px; border-bottom: 1px solid var(--border); }
+.infra-stat-row:last-child { border: none; }
+.infra-label { color: var(--muted); }
+.infra-val { font-weight: 600; color: var(--text); }
+.infra-divider { height: 1px; background: var(--border); margin: 6px 0; }
+.infra-flow-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; font-size: 11px; }
+.flow-badge { font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; letter-spacing: .03em; }
+.flow-c2b  { background: #1e3a5f; color: #60a5fa; }
+.flow-b2c  { background: #14532d; color: #4ade80; }
+.flow-b2b  { background: #44403c; color: #a8a29e; }
+.flow-count { font-weight: 600; color: var(--text); min-width: 28px; }
+.msg-type-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; font-size: 10px; }
+.msg-type-name { color: var(--muted); width: 110px; flex-shrink: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.msg-type-bar-wrap { flex: 1; height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; }
+.msg-type-bar { height: 100%; background: var(--accent); border-radius: 3px; }
+.msg-type-count { color: var(--text); font-weight: 600; min-width: 24px; text-align: right; }
+
 /* ── Scenario modal ── */
 .btn-scenario { background: #1a1a2e; border-color: #4a3f8a; color: var(--purple); }
 .btn-scenario:hover { background: #2d2750; }

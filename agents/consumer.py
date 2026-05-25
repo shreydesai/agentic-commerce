@@ -522,6 +522,8 @@ class ConsumerAgent(BaseAgent):
                             "merchant": chosen.get("merchant_name"),
                             "merchant_id": merchant_id,
                             "price": agreed_price,
+                            "quality_score": chosen.get("quality_score", 100),
+                            "has_quality_issues": chosen.get("has_quality_issues", False),
                             "order_id": msg.content.get("order_id"),
                             "transaction_id": self._txn_id(),
                         }
@@ -581,21 +583,44 @@ class ConsumerAgent(BaseAgent):
             self.state = ConsumerState.IDLE
             return
         last = self.purchase_history[-1]
+        quality_score = last.get("quality_score", 100)
+        has_quality_issues = last.get("has_quality_issues", False)
+
+        # Translate merchant quality score into plain-English context for the LLM
+        if quality_score >= 90:
+            quality_ctx = "The merchant has an excellent catalog — well-described products, clear policies, great reputation."
+        elif quality_score >= 70:
+            quality_ctx = "The merchant is solid but not exceptional — decent product info, reasonable policies."
+        elif quality_score >= 50:
+            quality_ctx = "The merchant has a mediocre catalog — some product details are missing or vague."
+        else:
+            quality_ctx = "The merchant has a poor catalog — incomplete product descriptions, missing policies, unclear what you'd actually get."
+
+        if has_quality_issues:
+            quality_ctx += " You noticed the listing had gaps in information before buying."
+
         result = await self.call_llm(
             system=f"You are {self.name}. {self.persona} Return ONLY valid JSON.",
             user=(
-                f"You just received {last['name']} from {last['merchant']} — you paid ${last['price']:.2f}. "
-                f"Your {self.persona[:80]}. Price sensitivity: {self.price_sensitivity:.1f}/1 "
-                f"(1=very price conscious). "
-                f"Think critically: Was it worth the price? Did it meet expectations for what you paid? "
-                f"Be honest — give 1-2 if it was disappointing or overpriced, 3 if it was just okay, "
-                f"4 if genuinely good value, 5 ONLY if it exceeded expectations. "
-                f"Highly price-sensitive consumers are harder to impress at higher price points. "
+                f"You just received '{last['name']}' from {last['merchant']} — you paid ${last['price']:.2f}.\n"
+                f"Merchant quality: {quality_ctx}\n"
+                f"Your persona: {self.persona[:100]}\n"
+                f"Price sensitivity: {self.price_sensitivity:.1f}/1 (1=very price conscious).\n"
+                f"Think critically: Was it worth the price? Did the merchant deliver on expectations?\n"
+                f"Rating guide: 1-2=disappointing/overpriced, 3=just okay, 4=genuinely good value, "
+                f"5=exceeded expectations (rare — only if truly surprised). "
+                f"A price-sensitive buyer at a low-quality merchant should rarely give more than 3. "
                 f"Return ONLY valid JSON: {{\"rating\": 1-5, \"review\": \"1-2 honest sentences\"}}"
             ),
         )
         if "error" in result:
-            result = {"rating": 3, "review": "It was okay, met basic expectations."}
+            # Fallback varies by merchant quality so it's not uniformly 3/5
+            if quality_score < 50:
+                result = {"rating": 2, "review": "Not what I expected based on the listing."}
+            elif quality_score < 75:
+                result = {"rating": 3, "review": "Decent enough, but the merchant could be more transparent."}
+            else:
+                result = {"rating": 4, "review": "Good experience overall."}
 
         # Update merchant satisfaction history
         rating = result.get("rating", 3)

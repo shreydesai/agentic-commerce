@@ -1,9 +1,11 @@
 import asyncio
 import json
+import time
 from typing import Optional
 import anthropic
 from config import ANTHROPIC_API_KEY, LLM_MODEL
 from simulation.events import SimEvent
+from simulation.stats import llm_stats, message_stats
 from acp.models import AgentMessage
 
 
@@ -50,6 +52,9 @@ class BaseAgent:
     ):
         if to_agent_id not in self.message_bus:
             return None
+        # Infer recipient type from agent_id prefix for message stats
+        to_type = "consumer" if to_agent_id.startswith("consumer") else "business"
+        message_stats.record(self.agent_type, to_type, message_type)
         msg = AgentMessage(
             from_agent_id=self.agent_id,
             to_agent_id=to_agent_id,
@@ -90,14 +95,17 @@ class BaseAgent:
         except asyncio.TimeoutError:
             return None
 
-    async def call_llm(self, system: str, user: str) -> dict:
+    async def call_llm(self, system: str, user: str, max_tokens: int = 256) -> dict:
+        t0 = time.perf_counter()
         try:
             response = await self.client.messages.create(
                 model=LLM_MODEL,
-                max_tokens=256,
+                max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": user}],
             )
+            latency_ms = (time.perf_counter() - t0) * 1000
+            truncated = (response.stop_reason == "max_tokens")
             text = response.content[0].text.strip()
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0].strip()
@@ -106,9 +114,20 @@ class BaseAgent:
             start, end = text.find("{"), text.rfind("}") + 1
             if start != -1 and end > start:
                 text = text[start:end]
-            return json.loads(text)
+            result = json.loads(text)
+            llm_stats.record(success=True, latency_ms=latency_ms, truncated=truncated)
+            return result
         except Exception as e:
-            return {"error": str(e)}
+            latency_ms = (time.perf_counter() - t0) * 1000
+            err = str(e)
+            error_type = (
+                "rate_limit" if "rate_limit" in err.lower() or "429" in err else
+                "timeout"    if "timeout"    in err.lower() else
+                "parse"      if isinstance(e, (json.JSONDecodeError, ValueError)) else
+                "other"
+            )
+            llm_stats.record(success=False, latency_ms=latency_ms, error_type=error_type)
+            return {"error": err}
 
     async def run(self):
         raise NotImplementedError

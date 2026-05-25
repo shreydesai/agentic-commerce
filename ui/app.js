@@ -657,6 +657,11 @@ function renderAnalytics() {
     .flatMap(b => b.strategy_notes.slice(-1).map(n => `${b.name}: ${n}`))
     .slice(0, 4);
 
+  // Infrastructure stats
+  const infra = state.infra || {};
+  const llm  = infra.llm      || {};
+  const msgs = infra.messages || {};
+
   // Revenue sparkline SVG
   const sparkSVG = buildSparkline(revenueHistory, 280, 50);
 
@@ -729,6 +734,75 @@ function renderAnalytics() {
         <div class="analytics-section-title">🧠 AI Strategy Notes</div>
         ${strategyInsights.map(s => `<div class="strategy-note">${esc(s)}</div>`).join('')}
       </div>` : ''}
+
+      <!-- Infrastructure -->
+      <div class="analytics-section infra-section">
+        <div class="analytics-section-title">⚙️ Infrastructure</div>
+        <div class="infra-grid">
+
+          <!-- LLM reliability -->
+          <div class="infra-card">
+            <div class="infra-card-title">LLM Reliability</div>
+            ${llm.total_calls > 0 ? (() => {
+              const successPct = Math.round((llm.success_rate || 0) * 100);
+              const truncPct   = Math.round((llm.truncation_rate || 0) * 100);
+              const color = successPct >= 99 ? 'var(--green)' : successPct >= 95 ? 'var(--yellow)' : 'var(--red)';
+              const errEntries = Object.entries(llm.errors_by_type || {});
+              return `
+              <div class="infra-stat-row">
+                <span class="infra-label">Total calls</span>
+                <span class="infra-val">${llm.total_calls.toLocaleString()}</span>
+              </div>
+              <div class="infra-stat-row">
+                <span class="infra-label">Success rate</span>
+                <span class="infra-val" style="color:${color}">${successPct}%</span>
+              </div>
+              <div class="infra-stat-row">
+                <span class="infra-label">Avg latency</span>
+                <span class="infra-val">${llm.avg_latency_ms ? (llm.avg_latency_ms/1000).toFixed(2)+'s' : '—'}</span>
+              </div>
+              <div class="infra-stat-row">
+                <span class="infra-label">Truncated</span>
+                <span class="infra-val" style="color:${truncPct > 5 ? 'var(--red)' : truncPct > 0 ? 'var(--yellow)' : 'var(--muted)'}">${llm.truncations} (${truncPct}%)</span>
+              </div>
+              ${errEntries.length ? `<div class="infra-stat-row">
+                <span class="infra-label">Errors</span>
+                <span class="infra-val" style="color:var(--red)">${errEntries.map(([k,v])=>`${k}:${v}`).join(', ')}</span>
+              </div>` : ''}`;
+            })() : '<div class="analytics-empty">No LLM calls yet</div>'}
+          </div>
+
+          <!-- ACP message volume -->
+          <div class="infra-card">
+            <div class="infra-card-title">Agent Messages (ACP)</div>
+            ${msgs.total > 0 ? (() => {
+              const byType = msgs.by_type || {};
+              const topTypes = Object.entries(byType).slice(0, 6);
+              const maxVal = topTypes.length ? topTypes[0][1] : 1;
+              return `
+              <div class="infra-flow-row">
+                <span class="flow-badge flow-c2b">C→B</span>
+                <span class="flow-count">${(msgs.consumer_to_business||0).toLocaleString()}</span>
+                <span class="flow-badge flow-b2c">B→C</span>
+                <span class="flow-count">${(msgs.business_to_consumer||0).toLocaleString()}</span>
+                <span class="flow-badge flow-b2b">B→B</span>
+                <span class="flow-count">${(msgs.business_to_business||0).toLocaleString()}</span>
+              </div>
+              <div class="infra-divider"></div>
+              ${topTypes.map(([type, count]) => {
+                const barPct = Math.round((count / maxVal) * 100);
+                return `<div class="msg-type-row">
+                  <span class="msg-type-name">${esc(type.replace(/_/g,' '))}</span>
+                  <div class="msg-type-bar-wrap"><div class="msg-type-bar" style="width:${barPct}%"></div></div>
+                  <span class="msg-type-count">${count}</span>
+                </div>`;
+              }).join('')}`;
+            })() : '<div class="analytics-empty">No messages yet</div>'}
+          </div>
+
+        </div>
+      </div>
+
     </div>`;
 }
 

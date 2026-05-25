@@ -4,6 +4,7 @@ from agents.consumer import ConsumerAgent
 from agents.business import BusinessAgent
 from simulation.seed_data import ALL_BUSINESSES, CONSUMERS
 from simulation.events import SimEvent
+from simulation.stats import llm_stats, message_stats
 from db.persistence import save_simulation, load_simulation, save_transaction
 from config import DB_PATH, SIMULATION_SPEED_FACTOR
 
@@ -101,6 +102,8 @@ class SimulationEngine:
         self._initialized = False
         self.active_scenarios = []
         self._scenario_originals = {}
+        llm_stats.reset()
+        message_stats.reset()
         self._build_agents(saved_state)
         self._initialized = True
 
@@ -283,6 +286,10 @@ class SimulationEngine:
                 "active_consumers": active_consumers,
                 "active_transactions": active_transactions,
                 "total_events": len(self.event_history),
+            },
+            "infra": {
+                "llm": llm_stats.to_dict(),
+                "messages": message_stats.to_dict(),
             },
             "transactions": list(self.transactions.values()),
             "recent_events": self.event_history[-50:],

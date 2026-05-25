@@ -364,6 +364,7 @@ class BusinessAgent(BaseAgent):
                     f"Return: {{\"adjustments\": [{{\"sku\": \"X\", \"new_price\": 0.0, \"reason\": \"brief\"}}], "
                     f"\"strategy\": \"one sentence on overall approach\"}}"
                 ),
+                max_tokens=400,
             )
             if "error" in result:
                 raise ValueError(result["error"])
