@@ -153,16 +153,16 @@ class TestStateStructure:
 
     def test_state_consumer_count(self, client):
         s = client.get("/api/state").json()
-        assert len(s["consumers"]) == 5
+        assert len(s["consumers"]) == 10
 
     def test_state_business_count(self, client):
         s = client.get("/api/state").json()
-        assert len(s["businesses"]) == 12
+        assert len(s["businesses"]) == 17
 
     def test_state_b2c_count(self, client):
         s = client.get("/api/state").json()
         b2c = [b for b in s["businesses"] if b.get("business_type") == "B2C"]
-        assert len(b2c) == 8
+        assert len(b2c) == 13
 
     def test_state_b2b_count(self, client):
         s = client.get("/api/state").json()
@@ -428,8 +428,8 @@ class TestSimulationLifecycle:
     def test_start_state_has_all_agents(self, client):
         r = client.post("/api/start?mode=fresh")
         s = r.json()["state"]
-        assert len(s["consumers"]) == 5
-        assert len(s["businesses"]) == 12
+        assert len(s["consumers"]) == 10
+        assert len(s["businesses"]) == 17
         client.post("/api/stop")
 
     def test_start_state_has_businesses_not_merchants(self, client):

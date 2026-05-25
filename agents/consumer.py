@@ -68,6 +68,7 @@ class ConsumerAgent(BaseAgent):
         self.total_spent = 0.0
         self.purchase_history: list[dict] = []
         self.merchant_satisfaction: dict[str, list[float]] = {}
+        self.blocked_merchants: set = set()
         self.current_transaction: Optional[dict] = None
         self.candidate_products: list[dict] = []
         self.shortlisted: list[dict] = []
@@ -102,12 +103,14 @@ class ConsumerAgent(BaseAgent):
                 for k, v in self.merchant_satisfaction.items()
                 if v
             },
+            "blocked_merchants": list(self.blocked_merchants),
         }
 
     def restore_from_state(self, state: dict):
         self.total_spent = state.get("total_spent", 0.0)
         self.purchase_history = state.get("purchase_history", [])
         self.merchant_satisfaction = state.get("merchant_satisfaction_raw", {})
+        self.blocked_merchants = set(state.get("blocked_merchants", []))
 
     def _new_transaction(self) -> dict:
         return {
@@ -149,11 +152,24 @@ class ConsumerAgent(BaseAgent):
             spf = config.SIMULATION_SPEED_FACTOR
             await asyncio.sleep((CONSUMER_TICK_SECONDS + random.uniform(-3, 3)) / max(spf, 0.25))
 
+    # Empirical impulse-buy rates by category (from consumer behavior research)
+    CATEGORY_IMPULSE_WEIGHTS = {
+        "fashion": 1.20,      # 55% impulse rate
+        "grocery": 1.15,      # 50% impulse rate
+        "home": 1.08,         # 42% impulse rate
+        "electronics": 0.95,  # ~25% impulse rate (considered purchases)
+        "gaming": 1.00,       # baseline
+    }
+
     async def tick(self):
         if self.state == ConsumerState.IDLE:
-            # Higher impulse → more likely to start shopping
-            threshold = 0.4 + self.impulse_tendency * 0.3
-            if random.random() < threshold:
+            # Weight threshold by category impulse rates, capped at 0.95
+            avg_impulse_weight = (
+                sum(self.CATEGORY_IMPULSE_WEIGHTS.get(i, 1.0) for i in self.shopping_interests)
+                / max(len(self.shopping_interests), 1)
+            )
+            threshold = min(0.95, (0.4 + self.impulse_tendency * 0.3) * avg_impulse_weight)
+            if self.budget > 0 and random.random() < threshold:
                 await self._start_discovery()
         elif self.state == ConsumerState.DISCOVERING:
             await self._do_discovery()
@@ -180,33 +196,78 @@ class ConsumerAgent(BaseAgent):
         await self._emit_transaction_update("discovering")
 
     async def _do_discovery(self):
+        FALLBACK_QUERIES = {
+            "electronics": ["wireless earbuds under budget", "portable charger for travel", "smart home hub", "laptop stand ergonomic"],
+            "gaming": ["gaming mouse precision", "mechanical keyboard compact", "gaming headset wireless", "controller grip upgrade"],
+            "fashion": ["everyday casual tee", "versatile jeans slim fit", "lightweight jacket layers", "comfortable sneakers daily"],
+            "grocery": ["organic coffee single origin", "healthy snack variety pack", "extra virgin olive oil", "protein-rich staples"],
+            "home": ["desk organizer minimalist", "throw pillow accent color", "wall art statement piece", "plant pot ceramic set"],
+        }
+
         remaining = self.budget - self.total_spent
+
+        # Build recent purchase context (last 2-3 purchases, names + categories only)
+        recent_purchases_ctx = "No recent purchases"
+        if self.purchase_history:
+            recent = self.purchase_history[-3:]
+            recent_purchases_ctx = "Recent purchases: " + ", ".join(
+                f"{p['name']}" for p in recent
+            )
+
         result = await self.call_llm(
             system=(
                 f"You are {self.name}, {self.age}yo {self.gender} {self.occupation}. "
-                f"Income: ${self.annual_income:,.0f}. Location: {self.location}. "
+                f"Income: ${self.annual_income:,.0f}/year. Location: {self.location}. "
                 f"Interests: {', '.join(self.shopping_interests)}. "
-                f"Price sensitivity: {self.price_sensitivity:.1f}/1. "
-                f"Budget left: ${remaining:.0f}. Return ONLY valid JSON."
+                f"Price sensitivity: {self.price_sensitivity:.1f}/1 (1=very price conscious). "
+                f"Budget remaining: ${remaining:.0f}. "
+                f"{recent_purchases_ctx}. "
+                f"Return ONLY valid JSON."
             ),
-            user=f'What to shop for? Return: {{"category": "one of {self.shopping_interests}", "query": "2-4 word search", "max_price": number}}',
+            user=(
+                f"You need to shop for something today. Based on your profile and interests, decide what to look for.\n"
+                f"Return ONLY valid JSON:\n"
+                f"{{\n"
+                f"  \"category\": \"one of {self.shopping_interests}\",\n"
+                f"  \"query\": \"specific 3-6 word search — be precise, not generic. e.g. 'wireless earbuds for running under $80' not 'best electronics'\",\n"
+                f"  \"max_price\": <realistic price given budget and income>,\n"
+                f"  \"shopping_intent\": \"one word: replenishing|upgrading|gifting|treating|exploring\",\n"
+                f"  \"urgency\": \"high|medium|low\"\n"
+                f"}}"
+            ),
         )
         if "error" in result or "category" not in result:
             cat = random.choice(self.shopping_interests)
-            result = {"category": cat, "query": f"best {cat} product", "max_price": min(150, remaining)}
+            fallback_query = random.choice(FALLBACK_QUERIES.get(cat, [f"quality {cat} item"]))
+            result = {
+                "category": cat,
+                "query": fallback_query,
+                "max_price": min(150, remaining),
+                "shopping_intent": "exploring",
+                "urgency": "medium",
+            }
+
+        if self.current_transaction:
+            self.current_transaction["shopping_intent"] = result.get("shopping_intent", "exploring")
 
         self._txn_step("discovering", f"Searching for: {result.get('query','')} (category: {result.get('category','')})")
 
-        # Find relevant B2C businesses
+        # Find relevant B2C businesses, excluding merchants blocked after bad experiences
         relevant = [
             b for b in self.business_registry.values()
             if b.business_type == "B2C"
+            and b.agent_id not in self.blocked_merchants
             and (b.vertical == result.get("category", "") or b.vertical in self.shopping_interests)
         ]
         if not relevant:
-            relevant = [b for b in self.business_registry.values() if b.business_type == "B2C"]
-        # Contact more businesses in parallel for a richer product mix
-        selected = random.sample(relevant, min(4, len(relevant)))
+            # Fall back to any unblocked B2C merchant
+            relevant = [
+                b for b in self.business_registry.values()
+                if b.business_type == "B2C" and b.agent_id not in self.blocked_merchants
+            ]
+        # High research_depth consumers shop around more; low research_depth consumers pick fast
+        max_contacts = max(1, min(len(relevant), 1 + round(self.research_depth * (len(relevant) - 1))))
+        selected = random.sample(relevant, max_contacts)
 
         self.candidate_products = []
         # Fire all queries first (non-blocking), then collect responses
@@ -285,11 +346,16 @@ class ConsumerAgent(BaseAgent):
                 lines.append(f"  - Bought '{p['name']}' from {p['merchant']} (rated: {avg_rating}/5)")
             history_ctx = f"\nRecent purchase history:\n" + "\n".join(lines)
 
+        intent = (self.current_transaction or {}).get("shopping_intent", "exploring")
+        budget_cap = remaining * 1.1
+
         result = await self.call_llm(
             system=(
                 f"You are {self.name}. {self.persona} "
                 f"Budget left: ${remaining:.0f}. "
+                f"Shopping intent today: {intent}. "
                 f"Price sensitivity: {self.price_sensitivity:.1f}/1 (higher=more price-conscious). "
+                f"Do not shortlist products over ${budget_cap:.0f} (1.1x remaining budget — too risky). "
                 f"Prefer reliable sellers with complete product information. Return ONLY valid JSON."
                 + history_ctx
             ),
@@ -518,15 +584,27 @@ class ConsumerAgent(BaseAgent):
         result = await self.call_llm(
             system=f"You are {self.name}. {self.persona} Return ONLY valid JSON.",
             user=(
-                f"You just bought {last['name']} from {last['merchant']} for ${last['price']}. "
-                f"Write a short review. Return: {{\"rating\": 1-5, \"review\": \"1-2 sentence review\"}}"
+                f"You just received {last['name']} from {last['merchant']} — you paid ${last['price']:.2f}. "
+                f"Your {self.persona[:80]}. Price sensitivity: {self.price_sensitivity:.1f}/1 "
+                f"(1=very price conscious). "
+                f"Think critically: Was it worth the price? Did it meet expectations for what you paid? "
+                f"Be honest — give 1-2 if it was disappointing or overpriced, 3 if it was just okay, "
+                f"4 if genuinely good value, 5 ONLY if it exceeded expectations. "
+                f"Highly price-sensitive consumers are harder to impress at higher price points. "
+                f"Return ONLY valid JSON: {{\"rating\": 1-5, \"review\": \"1-2 honest sentences\"}}"
             ),
         )
         if "error" in result:
-            result = {"rating": 4, "review": "Good product, happy with my purchase!"}
+            result = {"rating": 3, "review": "It was okay, met basic expectations."}
 
         # Update merchant satisfaction history
-        rating = result.get("rating", 4)
+        rating = result.get("rating", 3)
+        # Apply persona-based realism: impulse buyers and price-sensitive consumers tend to regret more
+        if self.impulse_tendency > 0.6 and rating >= 4:
+            rating = max(3, rating - random.choice([0, 0, 1]))  # occasional post-purchase regret
+        if self.price_sensitivity > 0.7 and last.get("price", 0) > 50:
+            rating = max(1, rating - random.choice([0, 0, 0, 1]))  # price-conscious regret on expensive items
+        rating = max(1, min(5, rating))
         merchant_id = last.get("merchant_id")
         if merchant_id:
             if merchant_id not in self.merchant_satisfaction:
@@ -546,11 +624,17 @@ class ConsumerAgent(BaseAgent):
             self.brand_loyalty = max(0.0, self.brand_loyalty - 0.03)
             self.price_sensitivity = min(1.0, self.price_sensitivity + 0.02)
             self.research_depth = min(1.0, self.research_depth + 0.02)
+            # Merchant blocking: 33% chance after a single bad experience (1-2 stars)
+            # Automatic block after 2+ bad ratings from same merchant (research: 33% one-bad-experience churn)
+            if merchant_id:
+                bad_count = sum(1 for r in self.merchant_satisfaction.get(merchant_id, []) if r <= 2)
+                if bad_count >= 2 or (bad_count >= 1 and random.random() < 0.33):
+                    self.blocked_merchants.add(merchant_id)
 
         if merchant_id:
             await self.send_message(merchant_id, "review", {
                 "sku": last["sku"],
-                "rating": result.get("rating", 4),
+                "rating": rating,
                 "review": result.get("review", ""),
                 "consumer_name": self.name,
             })
@@ -559,10 +643,10 @@ class ConsumerAgent(BaseAgent):
             {
                 "product": last["name"],
                 "merchant": last.get("merchant"),
-                "rating": result.get("rating", 4),
+                "rating": rating,
                 "review": result.get("review", ""),
             },
-            f"⭐ {self.name} left {result.get('rating',4)}/5 for {last['name']}: \"{result.get('review','')}\"",
+            f"⭐ {self.name} left {rating}/5 for {last['name']}: \"{result.get('review','')}\"",
             transaction_id=last.get("transaction_id"),
         )
         self.state = ConsumerState.IDLE

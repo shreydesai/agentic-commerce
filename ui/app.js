@@ -15,9 +15,11 @@ const FILTER_SETS = {
   transactions: new Set(['state_change','product_query','agent_question','agent_answer',
     'purchase_completed','purchase_passed','budget_exceeded','review_posted','transaction_update']),
   purchases: new Set(['purchase_completed']),
-  supply: new Set(['supply_order_sent','supply_order_fulfilled','supply_received','out_of_stock']),
   reviews: new Set(['review_posted','review_received']),
 };
+
+// Tracks which transaction cards the user has expanded (persists across re-renders)
+const expandedTxns = new Set();
 
 // ── Network canvas ─────────────────────────────────────────────
 const netNodes = {};   // agent_id → {x, y, type, name, label, state}
@@ -471,14 +473,16 @@ function renderTxnView(transactions) {
         </div>`;
     }
 
+    const tid = txn.transaction_id;
+    const isOpen = expandedTxns.has(tid);
     card.innerHTML = `
-      <div class="txn-header" onclick="this.nextElementSibling.classList.toggle('open')">
+      <div class="txn-header" onclick="toggleTxnCard(this,'${tid}')">
         <span class="txn-consumer">${consumerLabel}</span>
         <span class="txn-status ${statusClass}">${statusLabel}</span>
         ${totalStr}
-        <span style="font-size:10px;color:var(--muted);flex-shrink:0">${txn.transaction_id}</span>
+        <span class="txn-chevron">${isOpen ? '▾' : '▸'}</span>
       </div>
-      <div class="txn-body">
+      <div class="txn-body${isOpen ? ' open' : ''}">
         <div class="txn-steps">${stepsHtml || '<div style="font-size:11px;color:var(--muted);padding:4px 0">No steps recorded yet</div>'}</div>
         ${msgsHtml}
       </div>`;
@@ -487,6 +491,16 @@ function renderTxnView(transactions) {
   if (!sorted.length) {
     el.innerHTML = '<div style="padding:16px;color:var(--muted);font-size:12px">No transactions yet — start the simulation.</div>';
   }
+}
+
+function toggleTxnCard(headerEl, txnId) {
+  const body = headerEl.nextElementSibling;
+  const nowOpen = body.classList.toggle('open');
+  if (nowOpen) expandedTxns.add(txnId);
+  else expandedTxns.delete(txnId);
+  // Flip chevron
+  const chev = headerEl.querySelector('.txn-chevron');
+  if (chev) chev.textContent = nowOpen ? '▾' : '▸';
 }
 
 function toggleMsgPayload(id) {

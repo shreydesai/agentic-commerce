@@ -11,11 +11,11 @@ def engine():
 
 
 def test_engine_initializes_agents(engine):
-    assert len(engine.consumers) == 5
-    assert len(engine.businesses) == 12  # 5 high-quality + 3 imperfect + 4 B2B
+    assert len(engine.consumers) == 10
+    assert len(engine.businesses) == 17  # 10 B2C (5 HQ + 5 new HQ) + 3 imperfect + 4 B2B
     b2c = [b for b in engine.businesses.values() if b.business_type == "B2C"]
     b2b = [b for b in engine.businesses.values() if b.business_type == "B2B"]
-    assert len(b2c) == 8
+    assert len(b2c) == 13
     assert len(b2b) == 4
 
 
@@ -122,5 +122,5 @@ def test_engine_reset_reinitializes(engine):
 
     engine.reset()
     assert len(engine.transactions) == 0
-    assert len(engine.consumers) == 5
-    assert len(engine.businesses) == 12
+    assert len(engine.consumers) == 10
+    assert len(engine.businesses) == 17

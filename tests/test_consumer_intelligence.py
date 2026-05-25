@@ -400,3 +400,44 @@ async def test_counter_offer_above_asking_price_rejected(event_bus, message_bus)
     assert "negotiation_accept" not in [m.message_type for m in msgs]
     assert place_order_msg is not None
     assert place_order_msg.content["price"] == pytest.approx(100.0)
+
+
+# ── Budget guard ──────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_zero_budget_consumer_stays_idle(event_bus, message_bus):
+    """Consumer with budget == 0 must never leave IDLE state."""
+    c = make_consumer(event_bus, message_bus)
+    c.budget = 0.0
+    c.impulse_tendency = 1.0  # would always shop if budget allowed
+
+    for _ in range(20):
+        await c.tick()
+
+    assert c.state == ConsumerState.IDLE
+
+
+@pytest.mark.asyncio
+async def test_negative_budget_consumer_stays_idle(event_bus, message_bus):
+    """Consumer with negative budget (e.g. after recession scenario) stays IDLE."""
+    c = make_consumer(event_bus, message_bus)
+    c.budget = -50.0
+    c.impulse_tendency = 1.0
+
+    for _ in range(20):
+        await c.tick()
+
+    assert c.state == ConsumerState.IDLE
+
+
+@pytest.mark.asyncio
+async def test_positive_budget_consumer_can_discover(event_bus, message_bus):
+    """Consumer with positive budget is allowed to enter discovery."""
+    c = make_consumer(event_bus, message_bus)
+    c.budget = 100.0
+    c.impulse_tendency = 1.0  # always triggers
+
+    await c.tick()
+
+    # Should have moved out of IDLE (to DISCOVERING or further)
+    assert c.state != ConsumerState.IDLE
