@@ -58,10 +58,21 @@ class BaseAgent:
         )
         await self.message_bus[to_agent_id].put(msg)
 
+        # Always log the full ACP message content (message inspector / protocol view)
+        await self.emit_event(
+            "acp_message",
+            {"message_type": message_type, "content": content},
+            f"{self.name} → {to_agent_id}: [{message_type}]",
+            transaction_id=transaction_id,
+            from_agent_id=self.agent_id,
+            to_agent_id=to_agent_id,
+        )
+
         # Emit network visualization event for key messages
         if emit_network and message_type in {
             "product_query", "place_order", "question", "supply_order",
             "product_response", "order_confirmation", "question_answer",
+            "supply_confirmation", "review", "order_rejected",
         }:
             await self.emit_event(
                 "network_message",

@@ -5,7 +5,7 @@ from agents.business import BusinessAgent
 from simulation.seed_data import ALL_BUSINESSES, CONSUMERS
 from simulation.events import SimEvent
 from db.persistence import save_simulation, load_simulation, save_transaction
-from config import DB_PATH
+from config import DB_PATH, SIMULATION_SPEED_FACTOR
 
 
 class SimulationEngine:
@@ -18,7 +18,11 @@ class SimulationEngine:
         self.running = False
         self.tasks: list = []
         self.event_history: list = []
+        self.message_log: list = []
         self._initialized = False
+        self.speed_factor: float = SIMULATION_SPEED_FACTOR
+        self.active_scenarios: list[str] = []
+        self._scenario_originals: dict = {}
 
     def initialize(self):
         if self._initialized:
@@ -92,7 +96,11 @@ class SimulationEngine:
         self.businesses.clear()
         self.message_bus.clear()
         self.transactions.clear()
+        self.event_history.clear()
+        self.message_log.clear()
         self._initialized = False
+        self.active_scenarios = []
+        self._scenario_originals = {}
         self._build_agents(saved_state)
         self._initialized = True
 
@@ -153,6 +161,108 @@ class SimulationEngine:
             except Exception:
                 pass
 
+    def set_speed(self, factor: float):
+        self.speed_factor = max(0.25, min(5.0, factor))
+        import config
+        config.SIMULATION_SPEED_FACTOR = self.speed_factor
+
+    def apply_scenario(self, scenario_type: str) -> str:
+        """Mutate live agent state to simulate market conditions."""
+
+        if scenario_type == "reset":
+            # Restore saved originals
+            for consumer_id, orig in self._scenario_originals.get("consumers", {}).items():
+                c = self.consumers.get(consumer_id)
+                if c:
+                    for k, v in orig.items():
+                        setattr(c, k, v)
+            for biz_id, orig in self._scenario_originals.get("businesses", {}).items():
+                b = self.businesses.get(biz_id)
+                if b:
+                    if "inventory" in orig:
+                        b.inventory = dict(orig["inventory"])
+                    if "catalog_prices" in orig:
+                        for sku, price in orig["catalog_prices"].items():
+                            if sku in b.catalog:
+                                b.catalog[sku]["price"] = price
+            self.active_scenarios.clear()
+            self._scenario_originals = {}
+            return "Simulation reset to original values"
+
+        # Save originals before first modification
+        if not self._scenario_originals:
+            self._scenario_originals["consumers"] = {
+                c_id: {"budget": c.budget, "impulse_tendency": c.impulse_tendency,
+                       "price_sensitivity": c.price_sensitivity}
+                for c_id, c in self.consumers.items()
+            }
+            self._scenario_originals["businesses"] = {
+                b_id: {"inventory": dict(b.inventory),
+                       "catalog_prices": {sku: p["price"] for sku, p in b.catalog.items()}}
+                for b_id, b in self.businesses.items()
+            }
+
+        if scenario_type == "recession":
+            for c in self.consumers.values():
+                c.budget = max(50, c.budget * 0.60)
+                c.price_sensitivity = min(1.0, c.price_sensitivity + 0.20)
+            self.active_scenarios.append("recession")
+            return "📉 Recession applied: consumer budgets cut 40%, price sensitivity up"
+
+        elif scenario_type == "black_friday":
+            for c in self.consumers.values():
+                c.budget = c.budget * 1.30
+                c.impulse_tendency = min(1.0, c.impulse_tendency + 0.25)
+            self.active_scenarios.append("black_friday")
+            return "🛍️ Black Friday: budgets +30%, impulse tendency +25%"
+
+        elif scenario_type == "supply_shock":
+            for b in self.businesses.values():
+                if b.business_type == "B2B":
+                    for sku in b.inventory:
+                        b.inventory[sku] = max(2, b.inventory[sku] // 10)
+            self.active_scenarios.append("supply_shock")
+            return "🏭 Supply shock: B2B supplier inventories reduced to ~10%"
+
+        elif scenario_type == "price_war":
+            for b in self.businesses.values():
+                if b.business_type == "B2C":
+                    for sku, product in b.catalog.items():
+                        product["price"] = round(product["price"] * 0.80, 2)
+            self.active_scenarios.append("price_war")
+            return "💥 Price war: all B2C prices reduced 20%"
+
+        elif scenario_type == "quality_boost":
+            # Give imperfect businesses a minimal FAQ and policy boost
+            for b in self.businesses.values():
+                if b.business_type == "B2C" and b.quality_score < 65:
+                    if not b.faqs:
+                        b.faqs = [
+                            {"question": "What is your return policy?", "answer": "30-day returns accepted."},
+                            {"question": "How long does shipping take?", "answer": "3-5 business days."},
+                        ]
+                    if not b.policies.get("return_policy"):
+                        b.policies["return_policy"] = "30-day returns"
+                    if not b.policies.get("shipping_policy"):
+                        b.policies["shipping_policy"] = "Standard 3-5 day shipping"
+                    # Fix zero-priced products
+                    for sku, product in b.catalog.items():
+                        if product.get("price", 0) <= 0:
+                            product["price"] = product.get("base_price", 25.0) or 25.0
+                        if not product.get("description"):
+                            product["description"] = f"Quality {product.get('name', 'product')} — see details."
+                    # Recompute quality score
+                    from agents.business import compute_quality_score
+                    b.quality_score, b.quality_issues = compute_quality_score(
+                        b.catalog, b.description, b.faqs, b.policies,
+                        b.founded_year, b.employee_count, b.headquarters
+                    )
+            self.active_scenarios.append("quality_boost")
+            return "⭐ Quality boost: imperfect merchants improved their catalogs"
+
+        else:
+            return f"Unknown scenario: {scenario_type}"
+
     def get_state(self) -> dict:
         b2c = [b for b in self.businesses.values() if b.business_type == "B2C"]
         b2b = [b for b in self.businesses.values() if b.business_type == "B2B"]
@@ -176,4 +286,6 @@ class SimulationEngine:
             },
             "transactions": list(self.transactions.values()),
             "recent_events": self.event_history[-50:],
+            "speed_factor": self.speed_factor,
+            "active_scenarios": list(self.active_scenarios),
         }

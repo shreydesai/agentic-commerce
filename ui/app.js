@@ -2,8 +2,12 @@
 let state = { running: false, consumers: [], businesses: [], stats: {}, transactions: [] };
 let ws = null;
 let allEvents = [];
+let allMessages = [];
 let currentFilter = 'all';
 const MAX_FEED = 200;
+const MAX_MSGS = 300;
+const revenueHistory = [];  // {t: timestamp_ms, v: cumulative_revenue}
+const MAX_REVENUE_POINTS = 60;
 
 // Filter category → event type sets (mirrors simulation/events.py)
 const FILTER_SETS = {
@@ -23,8 +27,9 @@ let rafId = null;
 function initCanvas() {
   const canvas = document.getElementById('network-canvas');
   const resize = () => {
-    canvas.width = canvas.offsetWidth;
-    canvas.height = canvas.offsetHeight;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = canvas.offsetWidth * dpr;
+    canvas.height = canvas.offsetHeight * dpr;
     layoutNodes();
   };
   new ResizeObserver(resize).observe(canvas);
@@ -59,7 +64,7 @@ function initCanvas() {
 
 function layoutNodes() {
   const canvas = document.getElementById('network-canvas');
-  const W = canvas.width, H = canvas.height;
+  const W = canvas.offsetWidth, H = canvas.offsetHeight;
   const consumers = state.consumers || [];
   const b2c = (state.businesses || []).filter(b => b.business_type === 'B2C');
   const b2b = (state.businesses || []).filter(b => b.business_type === 'B2B');
@@ -100,11 +105,14 @@ function updateEdgeCount() {
 function renderNetwork() {
   const canvas = document.getElementById('network-canvas');
   const ctx = canvas.getContext('2d');
-  const W = canvas.width, H = canvas.height;
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.offsetWidth, H = canvas.offsetHeight;
   const now = Date.now();
   const EDGE_TTL = 4000;
 
-  ctx.clearRect(0, 0, W, H);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+  ctx.scale(dpr, dpr);
 
   // Update & draw edges
   for (let i = netEdges.length - 1; i >= 0; i--) {
@@ -186,6 +194,7 @@ function renderNetwork() {
     ctx.restore();
   }
 
+  ctx.restore(); // undo DPR scale
   rafId = requestAnimationFrame(renderNetwork);
 }
 
@@ -197,6 +206,9 @@ function connectWS() {
     const msg = JSON.parse(e.data);
     if (msg.type === 'state') applyState(msg.data);
     else if (msg.type === 'event') handleEvent(msg.data);
+    else if (msg.type === 'history') hydrateHistory(msg.data);
+    else if (msg.type === 'msg') handleMessage(msg.data);
+    else if (msg.type === 'msg_history') hydrateMessages(msg.data);
   };
   ws.onclose = () => setTimeout(connectWS, 2000);
 }
@@ -211,9 +223,16 @@ function handleEvent(ev) {
       product_query: '#8b5cf6', place_order: '#22c55e', question: '#f59e0b',
       supply_order: '#ffa657', product_response: '#a78bfa',
       order_confirmation: '#3fb950', question_answer: '#fbbf24',
+      supply_confirmation: '#a3e635', review: '#f472b6', order_rejected: '#f85149',
     };
     addEdge(ev.from_agent_id, ev.to_agent_id, ev.data?.message_type,
       colors[ev.data?.message_type] || ev.color);
+  }
+
+  if (ev.event_type === 'purchase_completed' && ev.data?.price) {
+    const lastRev = revenueHistory.length > 0 ? revenueHistory[revenueHistory.length-1].v : 0;
+    revenueHistory.push({t: Date.now(), v: lastRev + (ev.data.price || 0)});
+    if (revenueHistory.length > MAX_REVENUE_POINTS) revenueHistory.shift();
   }
 
   renderFeed();
@@ -235,6 +254,7 @@ function applyState(s) {
   renderB2C((s.businesses||[]).filter(b=>b.business_type==='B2C'));
   renderB2B((s.businesses||[]).filter(b=>b.business_type==='B2B'));
   if (currentFilter === 'transactions') renderTxnView(s.transactions||[]);
+  if (currentFilter === 'analytics') renderAnalytics();
 }
 
 function updateStats(stats) {
@@ -334,7 +354,7 @@ function renderBizCard(grid, b, typeClass) {
     </div>
     <div class="card-row" style="margin-bottom:4px">
       <div class="vtag ${vClass}">${typeLabel}</div>
-      <span style="font-size:11px;color:var(--muted)">${b.headquarters||''}</span>
+      <span class="card-hq">${esc(b.headquarters||'')}</span>
     </div>
     <div class="card-stats">
       <span class="cs">Rev: <span>$${b.total_revenue.toFixed(0)}</span></span>
@@ -349,19 +369,24 @@ function setFilter(f) {
   document.querySelectorAll('.filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === f));
   const feedEl = document.getElementById('feed');
   const txnEl = document.getElementById('txn-view');
+  const analyticsEl = document.getElementById('analytics-view');
+  feedEl.style.display = 'none';
+  txnEl.style.display = 'none';
+  analyticsEl.style.display = 'none';
   if (f === 'transactions') {
-    feedEl.style.display = 'none';
     txnEl.style.display = 'flex';
     renderTxnView(state.transactions || []);
+  } else if (f === 'analytics') {
+    analyticsEl.style.display = 'flex';
+    renderAnalytics();
   } else {
     feedEl.style.display = 'flex';
-    txnEl.style.display = 'none';
     renderFeed();
   }
 }
 
 function renderFeed() {
-  if (currentFilter === 'transactions') return;
+  if (currentFilter === 'transactions' || currentFilter === 'analytics') return;
   const filterSet = FILTER_SETS[currentFilter];
   const visible = filterSet ? allEvents.filter(e => filterSet.has(e.event_type)) : allEvents;
   const feed = document.getElementById('feed');
@@ -385,24 +410,78 @@ function renderTxnView(transactions) {
   const el = document.getElementById('txn-view');
   el.innerHTML = '';
   const sorted = [...transactions].sort((a,b) => (b.started_at||'').localeCompare(a.started_at||''));
+
+  // Agent name lookup for message thread display
+  const agentNames = {};
+  (state.consumers||[]).forEach(c => { agentNames[c.agent_id] = c.name; });
+  (state.businesses||[]).forEach(b => { agentNames[b.agent_id] = b.name; });
+
   sorted.forEach(txn => {
     const card = document.createElement('div');
     card.className = 'txn-card';
+    const isSupply = txn.type === 'supply';
     const statusClass = txn.status === 'completed' ? 'txn-completed'
       : txn.status === 'abandoned' ? 'txn-abandoned' : 'txn-active';
+    const statusLabel = (txn.status || '').replace(/_/g, ' ');
     const totalStr = txn.total ? `<span class="txn-total">$${txn.total.toFixed(2)}</span>` : '';
+
+    // Header label: supply transactions show both parties
+    const consumerLabel = isSupply
+      ? `<span class="txn-supply-badge">📦 Supply</span>${esc(txn.consumer_name)} → ${esc(txn.supplier_name || txn.supplier_id || '?')}`
+      : esc(txn.consumer_name || '?');
+
     const stepsHtml = (txn.funnel_steps||[]).map(s =>
-      `<div class="txn-step"><span class="txn-step-stage">${s.stage}</span>&nbsp;${esc(s.details||'')}</div>`
+      `<div class="txn-step"><span class="txn-step-stage">${esc(s.stage)}</span>&nbsp;${esc(s.details||'')}</div>`
     ).join('');
+
+    // Inline message thread for this transaction
+    const txnMsgs = allMessages.filter(m => m.transaction_id === txn.transaction_id);
+    let msgsHtml = '';
+    if (txnMsgs.length > 0) {
+      const rows = txnMsgs.map(m => {
+        const mt = m.data?.message_type || '?';
+        const color = MSG_TYPE_COLORS[mt] || '#58a6ff';
+        const fromId = m.from_agent_id || m.agent_id || '?';
+        const toId   = m.to_agent_id || '?';
+        const fromName = agentNames[fromId] || fromId.replace(/^(consumer_|biz_)/, '');
+        const toName   = agentNames[toId]   || toId.replace(/^(consumer_|biz_)/, '');
+        const ts = new Date(m.timestamp);
+        const t  = ts.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+        const content = m.data?.content || {};
+        const dc = JSON.parse(JSON.stringify(content));
+        if (Array.isArray(dc.products)) dc.products = `[${dc.products.length} item(s)]`;
+        const prettyJson = JSON.stringify(dc, null, 2);
+        const pid = `mp-${m.event_id || Math.random().toString(36).slice(2)}`;
+        return `
+          <div class="txn-msg-row">
+            <div class="txn-msg-header" onclick="toggleMsgPayload('${pid}')">
+              <span class="txn-msg-from">${esc(fromName)}</span>
+              <span class="txn-msg-arrow">→</span>
+              <span class="txn-msg-to">${esc(toName)}</span>
+              <span class="txn-msg-type" style="border-color:${color};color:${color}">${esc(mt)}</span>
+              <span class="txn-msg-time">${t}</span>
+            </div>
+            <div class="txn-msg-payload" id="${pid}"><pre>${esc(prettyJson)}</pre></div>
+          </div>`;
+      }).join('');
+      msgsHtml = `
+        <div class="txn-msgs">
+          <div class="txn-msgs-label">Agent Messages (${txnMsgs.length})</div>
+          ${rows}
+        </div>`;
+    }
 
     card.innerHTML = `
       <div class="txn-header" onclick="this.nextElementSibling.classList.toggle('open')">
-        <span class="txn-consumer">${esc(txn.consumer_name)}</span>
-        <span class="txn-status ${statusClass}">${txn.status}</span>
+        <span class="txn-consumer">${consumerLabel}</span>
+        <span class="txn-status ${statusClass}">${statusLabel}</span>
         ${totalStr}
-        <span style="font-size:10px;color:var(--muted)">${txn.transaction_id}</span>
+        <span style="font-size:10px;color:var(--muted);flex-shrink:0">${txn.transaction_id}</span>
       </div>
-      <div class="txn-steps">${stepsHtml || '<div style="font-size:11px;color:var(--muted);padding:6px 0">No steps recorded yet</div>'}</div>`;
+      <div class="txn-body">
+        <div class="txn-steps">${stepsHtml || '<div style="font-size:11px;color:var(--muted);padding:4px 0">No steps recorded yet</div>'}</div>
+        ${msgsHtml}
+      </div>`;
     el.appendChild(card);
   });
   if (!sorted.length) {
@@ -410,8 +489,25 @@ function renderTxnView(transactions) {
   }
 }
 
+function toggleMsgPayload(id) {
+  const el = document.getElementById(id);
+  if (el) el.classList.toggle('open');
+}
+
 // ── Startup modal ──────────────────────────────────────────────
 async function initModal() {
+  // If the simulation is already running (e.g. user navigated back from a
+  // detail page), skip the modal entirely and show the live state instead.
+  try {
+    const stateRes = await fetch('/api/state');
+    const currentState = await stateRes.json();
+    if (currentState.running) {
+      document.getElementById('startup-modal').classList.add('hidden');
+      applyState(currentState);
+      return;
+    }
+  } catch (e) { /* network error — fall through to modal */ }
+
   const res = await fetch('/api/db-status');
   const data = await res.json();
   const body = document.getElementById('modal-body');
@@ -439,6 +535,7 @@ async function initModal() {
 
 async function startSim(mode) {
   document.getElementById('startup-modal').classList.add('hidden');
+  revenueHistory.splice(0);
   const res = await fetch(`/api/start?mode=${mode}`, {method:'POST'});
   const data = await res.json();
   applyState(data.state);
@@ -451,11 +548,209 @@ async function stopSim() {
   applyState(data.state);
 }
 
+function hydrateHistory(events) {
+  // Server sends events oldest→newest; allEvents is newest→oldest (unshift order)
+  const reversed = [...events].reverse();
+  allEvents = reversed.concat(allEvents);
+  if (allEvents.length > MAX_FEED) allEvents = allEvents.slice(0, MAX_FEED);
+  renderFeed();
+  updateEdgeCount();
+}
+
+function hydrateMessages(events) {
+  allMessages = [...events].reverse().concat(allMessages);
+  if (allMessages.length > MAX_MSGS) allMessages = allMessages.slice(0, MAX_MSGS);
+  if (currentFilter === 'transactions') renderTxnView(state.transactions || []);
+}
+
+function handleMessage(ev) {
+  allMessages.unshift(ev);
+  if (allMessages.length > MAX_MSGS) allMessages = allMessages.slice(0, MAX_MSGS);
+  if (currentFilter === 'transactions') renderTxnView(state.transactions || []);
+}
+
+// ── ACP Message colours (mirrors canvas edge colours) ─────────
+const MSG_TYPE_COLORS = {
+  product_query:    '#8b5cf6',
+  product_response: '#a78bfa',
+  place_order:      '#22c55e',
+  order_confirmation:'#3fb950',
+  order_rejected:   '#f85149',
+  question:         '#f59e0b',
+  question_answer:  '#fbbf24',
+  supply_order:     '#ffa657',
+  supply_confirmation:'#a3e635',
+  review:           '#f472b6',
+};
+
 function clearFeed() { allEvents = []; renderFeed(); }
 
 // ── Helpers ────────────────────────────────────────────────────
 function setText(id, t) { const e = document.getElementById(id); if(e) e.textContent = t; }
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ── Analytics ──────────────────────────────────────────────────
+function buildSparkline(data, width, height) {
+  if (data.length < 2) return '';
+  const pad = 4;
+  const w = width - pad*2, h = height - pad*2;
+  const minV = 0, maxV = Math.max(1, data[data.length-1].v);
+  const pts = data.map((d, i) => {
+    const x = pad + (i / (data.length-1)) * w;
+    const y = pad + h - ((d.v - minV) / (maxV - minV)) * h;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const lastPt = pts.split(' ').slice(-1)[0].split(',');
+  return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+    <polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linejoin="round"/>
+    <circle cx="${lastPt[0]}" cy="${lastPt[1]}" r="3" fill="var(--accent)"/>
+    <text x="${width-pad}" y="${height-1}" fill="var(--muted)" font-size="9" text-anchor="end">$${data[data.length-1].v.toFixed(0)}</text>
+  </svg>`;
+}
+
+function renderAnalytics() {
+  const el = document.getElementById('analytics-view');
+  if (!el) return;
+
+  const stats = state.stats || {};
+  const businesses = state.businesses || [];
+  const consumers = state.consumers || [];
+  const transactions = state.transactions || [];
+
+  // Compute derived stats
+  const totalRevenue = stats.total_revenue || 0;
+  const totalOrders = stats.total_orders || 0;
+  const completedTxns = transactions.filter(t => t.status === 'completed').length;
+  const abandonedTxns = transactions.filter(t => t.status === 'abandoned').length;
+  const activeTxns = transactions.filter(t => !['completed','abandoned'].includes(t.status)).length;
+  const convRate = transactions.length > 0
+    ? Math.round(completedTxns / transactions.length * 100) : 0;
+
+  // Top businesses by revenue
+  const topBiz = [...businesses]
+    .filter(b => b.business_type === 'B2C')
+    .sort((a, b) => b.total_revenue - a.total_revenue)
+    .slice(0, 5);
+
+  // Consumer spending summary
+  const consumerSpend = [...consumers]
+    .sort((a, b) => b.total_spent - a.total_spent)
+    .slice(0, 5);
+
+  // Strategy notes (businesses with strategy_notes)
+  const strategyInsights = businesses
+    .filter(b => b.strategy_notes && b.strategy_notes.length > 0)
+    .flatMap(b => b.strategy_notes.slice(-1).map(n => `${b.name}: ${n}`))
+    .slice(0, 4);
+
+  // Revenue sparkline SVG
+  const sparkSVG = buildSparkline(revenueHistory, 280, 50);
+
+  el.innerHTML = `
+    <div class="analytics-grid">
+      <!-- KPI row -->
+      <div class="analytics-kpi-row">
+        <div class="kpi-card">
+          <div class="kpi-val">$${totalRevenue.toFixed(2)}</div>
+          <div class="kpi-label">Total Revenue</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-val">${totalOrders}</div>
+          <div class="kpi-label">Orders</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-val">${convRate}%</div>
+          <div class="kpi-label">Conv. Rate</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-val">${activeTxns}</div>
+          <div class="kpi-label">Active Txns</div>
+        </div>
+      </div>
+
+      <!-- Revenue chart -->
+      <div class="analytics-section">
+        <div class="analytics-section-title">Revenue Over Time</div>
+        ${revenueHistory.length > 1 ? `<div class="sparkline-wrap">${sparkSVG}</div>` : '<div class="analytics-empty">Purchases will appear here</div>'}
+      </div>
+
+      <!-- Funnel breakdown -->
+      <div class="analytics-section">
+        <div class="analytics-section-title">Transaction Funnel</div>
+        <div class="funnel-stats">
+          <div class="funnel-stat"><span class="funnel-dot" style="background:#3b82f6"></span>${transactions.length} started</div>
+          <div class="funnel-stat"><span class="funnel-dot" style="background:#22c55e"></span>${completedTxns} completed</div>
+          <div class="funnel-stat"><span class="funnel-dot" style="background:#6b7280"></span>${abandonedTxns} abandoned</div>
+          <div class="funnel-stat"><span class="funnel-dot" style="background:#f59e0b"></span>${activeTxns} in-progress</div>
+        </div>
+      </div>
+
+      <!-- Top merchants -->
+      <div class="analytics-section">
+        <div class="analytics-section-title">Merchant Leaderboard</div>
+        ${topBiz.length ? topBiz.map((b, i) => `
+          <div class="leaderboard-row">
+            <span class="lb-rank">#${i+1}</span>
+            <span class="lb-name">${esc(b.name)}</span>
+            <span class="lb-conv">${b.conversion_rate != null ? Math.round(b.conversion_rate*100)+'% conv' : ''}</span>
+            <span class="lb-rev">$${b.total_revenue.toFixed(0)}</span>
+          </div>`).join('') : '<div class="analytics-empty">No sales yet</div>'}
+      </div>
+
+      <!-- Consumer spending -->
+      <div class="analytics-section">
+        <div class="analytics-section-title">Consumer Spending</div>
+        ${consumerSpend.map(c => {
+          const pct = Math.max(2, Math.round((c.total_spent / c.budget) * 100));
+          return `<div class="consumer-spend-row">
+            <span class="cs-name">${esc(c.name.split(' ')[0])}</span>
+            <div class="cs-bar-wrap"><div class="cs-bar-fill" style="width:${pct}%;background:${pct>75?'var(--red)':pct>40?'var(--yellow)':'var(--green)'}"></div></div>
+            <span class="cs-amt">$${c.total_spent.toFixed(0)}/$${c.budget.toFixed(0)}</span>
+          </div>`;
+        }).join('')}
+      </div>
+
+      <!-- Strategy insights -->
+      ${strategyInsights.length ? `<div class="analytics-section">
+        <div class="analytics-section-title">🧠 AI Strategy Notes</div>
+        ${strategyInsights.map(s => `<div class="strategy-note">${esc(s)}</div>`).join('')}
+      </div>` : ''}
+    </div>`;
+}
+
+// ── Scenario engine ────────────────────────────────────────────
+function openScenarios() {
+  document.getElementById('scenario-modal').classList.remove('hidden');
+}
+function closeScenarios() {
+  document.getElementById('scenario-modal').classList.add('hidden');
+}
+
+async function triggerScenario(type) {
+  const statusEl = document.getElementById('scenario-status');
+  statusEl.textContent = `Applying ${type}…`;
+  try {
+    const r = await fetch(`/api/scenario`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({type}),
+    });
+    const d = await r.json();
+    statusEl.textContent = d.message || `✅ ${type} applied`;
+    // Refresh state
+    const stateRes = await fetch('/api/state');
+    applyState(await stateRes.json());
+  } catch(e) {
+    statusEl.textContent = `❌ Error: ${e.message}`;
+  }
+}
+
+async function updateSpeed(val) {
+  document.getElementById('speed-label').textContent = `${val}×`;
+  try {
+    await fetch(`/api/speed?factor=${val}`, {method:'POST'});
+  } catch(e) { /* ignore */ }
+}
 
 // ── Init ───────────────────────────────────────────────────────
 connectWS();

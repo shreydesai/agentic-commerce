@@ -24,6 +24,14 @@ EVENT_COLORS = {
     "transaction_update": "#60a5fa",
     "quality_warning": "#fbbf24",
     "network_message": "#475569",
+    "price_change": "#fb923c",
+    "negotiation_request": "#c084fc",
+    "counter_offer": "#a855f7",
+    "negotiation_accept": "#22c55e",
+    "negotiation_decline": "#f85149",
+    "strategy_update": "#38bdf8",
+    "catalog_update": "#fb923c",
+    "scenario_applied": "#fbbf24",
 }
 
 FILTER_CATEGORIES = {
@@ -32,6 +40,7 @@ FILTER_CATEGORIES = {
         "state_change", "product_query", "agent_question", "agent_answer",
         "purchase_completed", "purchase_passed", "budget_exceeded", "review_posted",
         "transaction_update",
+        "negotiation_request", "counter_offer", "negotiation_accept", "negotiation_decline",
     },
     "purchases": {"purchase_completed"},
     "supply": {"supply_order_sent", "supply_order_fulfilled", "supply_received", "out_of_stock"},

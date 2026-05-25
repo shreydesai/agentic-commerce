@@ -4,6 +4,27 @@ A structured vision grounded in current reality — what exists in 2025–2026, 
 
 ---
 
+## Simulation Changelog
+
+Features shipped to this simulation, narrowing the gap to the 2050 north star:
+
+| Version | Feature | Pillar(s) |
+|---|---|---|
+| v0.1 | Multi-agent B2C/B2B marketplace with ACP message protocol | 3 |
+| v0.1 | LLM-driven consumer funnel (discover → consider → convert → review) | 4 |
+| v0.1 | Quality scoring — imperfect catalogs cause real lost sales | 5 |
+| v0.1 | Supply chain automation — B2B restock loop with fulfillment delay | 7 |
+| v0.1 | SQLite persistence — resume simulation from saved state | — |
+| v0.2 | ACP negotiation protocol — consumer sends `negotiation_request`, merchant responds with `counter_offer` | 3, 6 |
+| v0.2 | Consumer memory — purchase history + per-merchant satisfaction fed back into LLM prompts | 4 |
+| v0.2 | Behavioral trait evolution — `brand_loyalty`, `price_sensitivity`, `research_depth` evolve post-purchase | 4 |
+| v0.2 | Business intelligence — LLM dynamic pricing, strategic reviews, poor-review response | 5, 10 |
+| v0.2 | Analytics dashboard — revenue sparkline, funnel breakdown, merchant leaderboard, AI strategy notes | — |
+| v0.2 | Scenario engine — recession, black friday, supply shock, price war, quality boost, reset | 10 |
+| v0.2 | Simulation speed control — 0.25×–5× multiplier applied live to all agent sleep loops | — |
+
+---
+
 ## Ground Truth: What Already Exists (2025–2026)
 
 Before projecting into the future it's worth anchoring to how fast this has moved already.
@@ -72,7 +93,7 @@ Before projecting into the future it's worth anchoring to how fast this has move
 
 **Today (2026):** Consumer agents have static or session-scoped preferences. Bain found trust varies sharply by category: 70% of consumers will let agents book flights autonomously, 65% hotels, far fewer for high-consideration physical goods. Shopify reports AI-attributed orders grew 11x between Jan 2025 and Jan 2026; Adobe's Holiday 2025 data showed AI-referred shoppers converted 31% higher than other channels, with revenue per visit up 254% YoY — but the preferences driving those conversions live in platform-owned models, not portable consumer-owned representations.
 
-**Near-term:** Preferences evolve from purchase history across sessions. A consumer who buys premium products repeatedly increases brand loyalty weight. Seasonal intent weighting. Budget updates as income events occur. Agents can explain each recommendation in plain language ("I chose this over the cheaper option because you've previously returned budget items in this category").
+**Near-term:** ✅ **Shipped (v0.2):** Behavioral traits (`brand_loyalty`, `price_sensitivity`, `research_depth`, `impulse_tendency`) evolve post-purchase based on satisfaction. Purchase history across sessions feeds back into LLM consideration and conversion prompts. Per-merchant satisfaction tracking influences future purchase decisions. Remaining: seasonal intent weighting, budget updates as income events, plain-language explanation of each recommendation choice.
 
 **2050 vision:** Consumer preference models are rich, dynamic, private neural representations owned by the consumer agent — not the marketplace. Merchants bid for *access* to serve that agent, not for data about the person. The consumer agent acts as a privacy-preserving intermediary: it can tell a merchant "this person values sustainability and free returns" without revealing demographic data. The human's role shifts from executor (browsing, clicking buy) to mandate-setter (defining values, risk tolerance, ethical constraints). The agent is an extension of human intent — it should never surprise the human, and should always be able to explain every decision.
 
@@ -82,7 +103,7 @@ Before projecting into the future it's worth anchoring to how fast this has move
 
 **Today (2026):** Quality scoring in this simulation is computed from catalog completeness and injected into consumer LLM prompts. In production, the analogous problem is real — thin product data, missing return policies, and sparse descriptions are measurably associated with lower conversion. The "Poisoned Apple Effect" (arXiv:2601.11496) documents a new class of attacks where sellers inject adversarial instructions into product descriptions to manipulate buyer agent behavior at scale — a real integrity threat with no current mitigation standard.
 
-**Near-term:** Quality scores update dynamically from reviews. Merchant catalog auditing flags compliance violations. A/B pricing tested at the agent level with automatic adoption. Early "agent poisoning" detection via anomaly scoring on product description embedding space.
+**Near-term:** ✅ **Shipped (v0.2):** Quality scores trigger automatic LLM-driven catalog improvements when avg rating < 3.2. LLM dynamic pricing adjusts catalog prices every 30 ticks based on inventory + conversion data. Strategic reviews every 50 ticks produce AI market insights visible in the analytics panel. Remaining: A/B pricing with automatic adoption, agent poisoning detection, compliance violation flagging.
 
 **2050 vision:** Catalog integrity is enforced at the protocol layer. Merchants can't list a product without machine-readable structured data: standardized schemas for dimensions, materials, certifications, carbon footprint, allergen info. Third-party auditor agents continuously verify inventory matches claims. Product descriptions are auto-generated from structured data by certified services, eliminating quality variance from hand-authoring. Pricing is transparent: full cost breakdown (product, logistics, platform fee, margin) is available to consumer agents on request. The Poisoned Apple attacks of the 2020s are defeated by signed, audited product data whose provenance is verifiable end-to-end.
 
@@ -92,7 +113,7 @@ Before projecting into the future it's worth anchoring to how fast this has move
 
 **Today (2026):** Pricing is fixed in almost all current implementations. Amazon Auto Buy sets a price trigger but does not negotiate — it waits. The research literature is alarming on what happens when agents do negotiate: four peer-reviewed papers (arXiv:2407.04088, arXiv:2410.00031, arXiv:2604.17774, arXiv:2601.03061) demonstrate that LLM agents autonomously achieve tacit price collusion without explicit instruction, and that stable collusive equilibria emerge even when agents lack competitor pricing history. The UK CMA acknowledged collusion as a "frontier challenge" in March 2026 but offered no enforcement framework.
 
-**Near-term:** Negotiation protocol for high-value B2B orders with counter-offers and expiry times. Bundle discounts. Price matching triggered by competitor quotes. Consumer agents with mandate ranges ("pay up to $X, prefer $Y, walk away at $Z"). Collusion detection heuristics flagging suspicious price convergence across competing merchant agents.
+**Near-term:** ✅ **Shipped (v0.2):** Full ACP negotiation protocol — consumer sends `negotiation_request` at 88% of asking price; merchant responds with LLM-driven `counter_offer` or `negotiation_decline` with floor at 82% of base_price; consumer accepts and places order at agreed price. Remaining: bundle discounts, multi-round auctions, price matching triggered by competitor quotes, collusion detection heuristics.
 
 **2050 vision:** Every commerce transaction is a micro-negotiation. Negotiation is real-time, iterative, and multi-dimensional: price, delivery speed, warranty, bundling, return window, payment schedule. For large B2B deals, agents conduct multi-round auctions across 20 competing suppliers simultaneously. Cartel detection agents (Gartner predicts "guardian agents" capture 10–15% of the agentic AI market by 2030) monitor for collusion patterns with regulatory reporting authority. The Preventing Algorithmic Collusion Act (introduced 2024) and its successors have been extended to explicitly cover multi-agent LLM systems.
 
@@ -132,7 +153,7 @@ Before projecting into the future it's worth anchoring to how fast this has move
 
 **Today (2026):** Academic research is already documenting emergent collusion in agent markets. A 2025 ASCE Journal of Management in Engineering paper confirmed tacit collusion in realistic construction bidding scenarios. arXiv:2603.20281 shows collusion is *fragile* under specific conditions — one honest agent can destabilize a collusive equilibrium — offering a potential mitigation strategy. The Poisoned Apple Effect (arXiv:2601.11496) documents sellers gaming buyer agents' decision heuristics at scale.
 
-**Near-term:** Price elasticity loops: merchant agents that lose transactions adjust prices downward; sellouts trigger markdowns for restocking. Consumer agents track loyalty effects across sessions. Anomaly detection for suspicious market price convergence.
+**Near-term:** ✅ **Shipped (v0.2):** Merchant LLM dynamic pricing creates real price elasticity loops (low stock → price up, overstock → price down). Consumer loyalty effects tracked across sessions via `merchant_satisfaction`. Market scenario engine lets operators inject recession, supply shock, price war, and other events to observe emergent market dynamics. Remaining: anomaly detection for collusion, RL-based price optimization against live demand signals.
 
 **2050 vision:** Agent marketplaces exhibit real emergent economic dynamics. Merchant agents continuously optimize pricing using RL against live demand signals. Markets clear in real time: oversupply triggers automatic markdowns, shortages trigger price spikes, consumer agents adjust demand accordingly. Guardian agents (monitoring other agents) are a mature market category. Antitrust enforcement agents automatically flag market concentration above regulatory thresholds. New merchant agents bootstrap reputation through lower-value transactions before accessing high-value customers. The market is a living organism: no central controller, just millions of agents pursuing their mandates.
 

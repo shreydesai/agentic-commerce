@@ -1,6 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from api.ws_manager import ConnectionManager
@@ -29,6 +29,16 @@ async def _event_forwarder():
         try:
             event = await asyncio.wait_for(sim.event_bus.get(), timeout=0.5)
             event_dict = event.model_dump(mode="json")
+
+            # ACP messages go to a separate log and WS channel so they don't
+            # pollute the activity feed event history.
+            if event.event_type == "acp_message":
+                sim.message_log.append(event_dict)
+                if len(sim.message_log) > 300:
+                    sim.message_log = sim.message_log[-300:]
+                await manager.broadcast({"type": "msg", "data": event_dict})
+                continue
+
             sim.event_history.append(event_dict)
             if len(sim.event_history) > 600:
                 sim.event_history = sim.event_history[-600:]
@@ -42,10 +52,13 @@ async def _event_forwarder():
             event_counter += 1
             await manager.broadcast({"type": "event", "data": event_dict})
             if event_counter % 4 == 0:
-                await manager.broadcast({"type": "state", "data": sim.get_state()})
+                state = sim.get_state()
+                state["speed_factor"] = sim.speed_factor
+                state["active_scenarios"] = sim.active_scenarios
+                await manager.broadcast({"type": "state", "data": state})
         except asyncio.TimeoutError:
             if manager.active_connections:
-                await manager.broadcast({"type": "heartbeat"})
+                await manager.broadcast({"type": "heartbeat", "speed_factor": sim.speed_factor})
         except Exception as e:
             print(f"Event forwarder error: {e}")
 
@@ -113,11 +126,54 @@ async def get_transactions():
     return {"transactions": list(sim.transactions.values())}
 
 
+@app.get("/api/messages")
+async def get_messages(limit: int = 100):
+    return {"messages": sim.message_log[-limit:]}
+
+
+@app.post("/api/scenario")
+async def apply_scenario(payload: dict = Body(...)):
+    """Apply a market scenario to the live simulation."""
+    scenario_type = payload.get("type", "")
+    if not sim.running:
+        return {"message": "Simulation is not running — start it first"}
+    message = sim.apply_scenario(scenario_type)
+    from simulation.events import SimEvent
+    event = SimEvent(
+        event_type="scenario_applied",
+        agent_id="system",
+        agent_name="Market System",
+        agent_type="system",
+        data={"scenario": scenario_type, "message": message},
+        message=f"⚡ Scenario '{scenario_type}': {message}",
+    )
+    await sim.event_bus.put(event)
+    return {"message": message, "active_scenarios": sim.active_scenarios}
+
+
+@app.get("/api/scenarios/active")
+async def get_active_scenarios():
+    return {"active_scenarios": sim.active_scenarios}
+
+
+@app.post("/api/speed")
+async def set_speed(factor: float = 1.0):
+    """Set simulation speed multiplier (0.25–5.0)."""
+    sim.set_speed(factor)
+    return {"speed_factor": sim.speed_factor}
+
+
 # ── WebSocket ───────────────────────────────────────────────────
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     await websocket.send_json({"type": "state", "data": sim.get_state()})
+    # Hydrate the feed with recent events so the activity log survives page navigation
+    if sim.event_history:
+        await websocket.send_json({"type": "history", "data": sim.event_history[-100:]})
+    # Hydrate the ACP message log
+    if sim.message_log:
+        await websocket.send_json({"type": "msg_history", "data": sim.message_log[-100:]})
     try:
         while True:
             try:

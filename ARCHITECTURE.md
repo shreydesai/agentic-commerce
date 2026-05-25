@@ -24,7 +24,9 @@ This document describes the major technical components of the agentic commerce s
 │  Routes:  GET /           GET /consumer/{id}   GET /business/{id}  │
 │           POST /api/start  POST /api/stop                           │
 │           GET /api/state   GET /api/transactions                    │
-│           GET /api/db-status                                        │
+│           GET /api/messages  GET /api/db-status                     │
+│           POST /api/scenario  GET /api/scenarios/active             │
+│           POST /api/speed                                           │
 │           WS  /ws                                                   │
 │                                                                     │
 │  WebSocketManager (ws_manager.py) — broadcast SimEvents to clients │
@@ -41,6 +43,8 @@ This document describes the major technical components of the agentic commerce s
 │  consumers: dict[id → ConsumerAgent]    (5 agents)                 │
 │  businesses: dict[id → BusinessAgent]   (8 B2C + 4 B2B = 12)      │
 │  transactions: dict[txn_id → dict]                                 │
+│  speed_factor: float (0.25–5.0, default 1.0)                       │
+│  active_scenarios: list[str]                                        │
 └────────┬──────────────────────────┬─────────────────────────────────┘
          │                          │
 ┌────────▼──────────┐   ┌───────────▼───────────────────────────────┐
@@ -78,7 +82,7 @@ Abstract base for all agents. Provides:
 
 ### `agents/consumer.py` — ConsumerAgent
 
-Runs an asyncio task that cycles through a purchase funnel every few seconds. Impulse tendency (`0.0–1.0`) controls how often shopping is triggered from idle. Transaction tracking: each shopping session gets a UUID `transaction_id` propagated through all events and messages.
+Runs an asyncio task that cycles through a purchase funnel every few seconds. Impulse tendency (`0.0–1.0`) controls how often shopping is triggered from idle. Transaction tracking: each shopping session gets a UUID `transaction_id` propagated through all events and messages. Sleep durations scale with `config.SIMULATION_SPEED_FACTOR` so the speed slider takes effect immediately.
 
 **Funnel stages:**
 
@@ -86,13 +90,19 @@ Runs an asyncio task that cycles through a purchase funnel every few seconds. Im
 |---|---|---|
 | idle | Random chance to start shopping | No |
 | discovering | Broadcasts `product_query` to all B2C merchants | No |
-| considering | Collects responses, calls LLM to shortlist top 3 | Yes |
-| converting | Calls LLM to pick winner, places order | Yes |
-| post_purchase | Sends review message to merchant | Yes (rating rationale) |
+| considering | Collects responses, calls LLM to shortlist top 3 (with quality scores + purchase history) | Yes |
+| converting | Calls LLM to pick winner; optionally initiates price negotiation; places order | Yes |
+| post_purchase | Sends review message to merchant; evolves behavioral traits | Yes (rating rationale) |
+
+**Consumer intelligence (new):**
+- `merchant_satisfaction: dict[str, list[float]]` — per-merchant rating history, fed back into conversion LLM prompts
+- Purchase history context (last 5 purchases with ratings) injected into consideration prompt
+- **Price negotiation:** consumers with `price_sensitivity > 0.52` and `research_depth > 0.35` send a `negotiation_request` at 88% of asking price; if the merchant counters at or below asking price, consumer accepts and uses the agreed price for `place_order`
+- **Trait evolution:** after each purchase, `brand_loyalty` / `price_sensitivity` / `research_depth` nudge ±0.01–0.03 based on rating (clamped to [0, 1])
 
 ### `agents/business.py` — BusinessAgent
 
-Unified B2C/B2B agent. Quality score (0–100) computed at init from catalog completeness, FAQs, policies, and company metadata. Score is included in consumer LLM prompts — imperfect catalogs (missing prices, sparse descriptions) cause real lost sales.
+Unified B2C/B2B agent. Quality score (0–100) computed at init from catalog completeness, FAQs, policies, and company metadata. Score is included in consumer LLM prompts — imperfect catalogs (missing prices, sparse descriptions) cause real lost sales. Sleep duration scales with `config.SIMULATION_SPEED_FACTOR`.
 
 **Quality score deductions:**
 - No/short description: −10
@@ -101,9 +111,31 @@ Unified B2C/B2B agent. Quality score (0–100) computed at init from catalog com
 - Missing founded year / employee count / headquarters: −3/−2/−2
 - Per product: no price −8, no description −4, no name −5
 
+**Business intelligence (new):**
+- `queries_received` / `queries_converted` / `conversion_rate` — funnel metrics exposed in state and analytics panel
+- `strategy_notes` — LLM-generated insights appended every 50 ticks, emitting `strategy_update` events visible in feed
+- **LLM-driven `_dynamic_pricing()`** (every 30 ticks): feeds inventory, conversion rate, and ratings to Claude; clamps prices to 75%–130% of `base_price`; falls back to rule-based logic (low stock → +15%, overstock → -10%)
+- **`_handle_poor_reviews(sku, avg_rating)`**: triggered when SKU avg < 3.2 (≥2 reviews); LLM rewrites description and emits `catalog_update`
+- **`_handle_negotiation_request(msg)`**: LLM decides accept/counter/decline; fallback rule (inventory > 15 and offer ≥ floor 82% of base → counter); emits `counter_offer` or `negotiation_decline`
+
 ### `simulation/engine.py` — SimulationEngine
 
 Orchestrates the simulation lifecycle. On `start(mode="fresh")` or `start(mode="load")`, builds all agents from seed data (or restores from SQLite), activates them, creates asyncio tasks. On `stop()`, cancels all tasks, saves full state JSON to SQLite.
+
+**New methods:**
+- `set_speed(factor)` — clamps to [0.25, 5.0], mutates `config.SIMULATION_SPEED_FACTOR` (picked up by agent sleep loops)
+- `apply_scenario(type)` — directly mutates live agent state; saves originals on first call for `reset`
+
+**Scenarios supported:**
+
+| Scenario | Effect |
+|---|---|
+| `recession` | Consumer budgets −40%, `price_sensitivity` +0.20 |
+| `black_friday` | Consumer budgets +30%, `impulse_tendency` +0.25 |
+| `supply_shock` | All B2B inventory → 10% of current |
+| `price_war` | All B2C catalog prices −20% |
+| `quality_boost` | Imperfect B2C merchants get FAQs, policies, fixed prices |
+| `reset` | Restore all original values |
 
 ### `simulation/seed_data.py` — Seed Data
 
@@ -119,6 +151,8 @@ Pre-defined agents for reproducibility:
 ### `simulation/events.py` — SimEvent
 
 Dataclass carrying: `event_type`, `message`, `data`, `timestamp`, `from_agent_id`, `to_agent_id`, `transaction_id`. Events with `from_agent_id` + `to_agent_id` drive the network canvas visualization. Filter categories (`FILTER_CATEGORIES`) map UI filter names to sets of event types.
+
+**New event types:** `negotiation_request` (purple), `counter_offer` (violet), `negotiation_accept` (green), `negotiation_decline` (red), `strategy_update` (sky blue), `catalog_update` (orange), `scenario_applied` (amber). Negotiation events are included in the `transactions` filter.
 
 ### `db/schema.py` + `db/persistence.py` — SQLite Persistence
 
@@ -149,6 +183,10 @@ On startup, the UI queries `/api/db-status` → shows a modal letting the user c
 
 **Network canvas** (`app.js`): animated bezier curves between agent nodes. Consumers positioned left (x=30px), businesses right (x=W−30px). Edges have a 4-second TTL. B2B-to-B2B edges curve rightward. Message type determines edge color.
 
+**Analytics panel** (new, `📊 Analytics` filter): KPI row (total revenue, orders, conversion rate, active transactions), SVG revenue sparkline (last 60 purchase events), transaction funnel breakdown, merchant leaderboard with conversion rates, consumer spending bars, AI strategy notes from businesses.
+
+**Scenarios modal** (new, `⚡ Scenarios` button): 6 market scenario buttons + simulation speed slider (1×–5×). Calls `POST /api/scenario` and `POST /api/speed`. Speed change takes effect on next agent sleep cycle without restart.
+
 ---
 
 ## Data Flow: Consumer Purchase
@@ -166,20 +204,28 @@ ConsumerAgent (idle)
 
 ConsumerAgent (considering)
   → collects all responses
-  → call_llm(shortlist top 3 with quality scores)
+  → call_llm(shortlist top 3 with quality scores + purchase history)
   → state: converting
-  → call_llm(pick winner)
-  → send_message(merchant, "place_order")  ──► network_message event → canvas edge
+  → call_llm(pick winner, with merchant satisfaction history)
+  → [optional] send_message(merchant, "negotiation_request")  ──► network_message event
+        │
+        └─► BusinessAgent._handle_negotiation_request()
+              → call_llm(accept/counter/decline) with floor = 82% of base_price
+              → send_message(consumer, "counter_offer" or "negotiation_decline")
+  → [if counter accepted] agreed_price = offered_price
+  → send_message(merchant, "place_order", price=agreed_price)  ──► network_message event → canvas edge
         │
         └─► BusinessAgent._handle_order()
               → decrement inventory
-              → total_revenue += amount
+              → total_revenue += amount; queries_converted++
               → send_message(consumer, "order_confirmation")
               → if inventory ≤ threshold: _reorder_from_supplier()
 
 ConsumerAgent (post_purchase)
   → call_llm(generate review text + rating)
   → send_message(merchant, "review")
+  → merchant_satisfaction[merchant_id].append(rating)
+  → evolve traits (brand_loyalty, price_sensitivity, research_depth)
   → _end_transaction(status="completed", ...)
   → emit transaction_update event  ──► API captures → save_transaction() → SQLite
   → state: idle
@@ -211,6 +257,7 @@ BusinessAgent (B2C, receives supply_confirmation)
 | `LLM_MODEL` | `claude-haiku-4-5-20251001` | Cheap model for all agent LLM calls |
 | `DB_PATH` | `simulation.db` | SQLite database file |
 | `LOW_INVENTORY_THRESHOLD` | `5` | Triggers B2B restock |
+| `SIMULATION_SPEED_FACTOR` | `1.0` | Global speed multiplier; mutated live by `POST /api/speed` |
 
 ---
 
